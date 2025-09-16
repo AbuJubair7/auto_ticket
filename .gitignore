@@ -6,6 +6,7 @@ __pycache__/
 venv/
 .env
 .env.*.local
+requirements.txt
 
 # Node / JavaScript
 node_modules/
@@ -13,6 +14,7 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 package-lock.json
+package.json
 npm-shrinkwrap.json
 yarn.lock
 pnpm-lock.yaml
