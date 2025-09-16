@@ -107,4 +107,8 @@ PREFERRED_COACHES=
 
 # Example: PREFERRED_SEATS=31,32 (use a comma to separate multiple seat numbers)
 PREFERRED_SEATS=
+
+# static configurations
+DEVICE_ID = 4004028937
+REQUEST_TIMEOUT = 20
 ```
