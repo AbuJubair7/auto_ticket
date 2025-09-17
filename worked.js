@@ -1,10 +1,11 @@
 /**
  * rail_booking.js
- * Final version: Corrects the logic for combining preferred coaches and seats.
+ * Final version: Makes all filtering from the config file case-insensitive.
  */
 
 const axios = require("axios");
 const readline = require("readline");
+require("dotenv").config(); // Loads environment variables from .env file
 
 // --- Main Script Flow ---
 (async function main() {
@@ -12,16 +13,27 @@ const readline = require("readline");
     const open = (await import("open")).default;
 
     const CONFIG = {
-      MOBILE: process.env.MOBILE || "01854078563",
-      PASSWORD: process.env.PASSWORD || "MSDdhoni@7",
-      FROM_CITY: process.env.FROM_CITY || "Kurigram", // from city
-      TO_CITY: process.env.TO_CITY || "Dhaka", // destination city
-      DATE_OF_JOURNEY: process.env.DATE_OF_JOURNEY || "18-Sep-2025", // format: "DD-MMM-YYYY"
-      SEAT_CLASS: process.env.SEAT_CLASS || "S_CHAIR", // e.g., "S_CHAIR", "AC_S_CHAIR", "FIRST_CLASS"
-      NEED_SEATS: 2, // Number of seats to book
-      TRAIN_NAME: "", // e.g., "Banalata" (leave empty for any train)
-      PREFERRED_COACHES: [""], // e.g., ['CHA', 'JA'] // leave empty for any coach
-      PREFERRED_SEATS: [], // e.g., [31, 32] (numbers only) // leave empty for any seat
+      MOBILE: process.env.MOBILE || "",
+      PASSWORD: process.env.PASSWORD || "",
+      FROM_CITY: process.env.FROM_CITY || "",
+      TO_CITY: process.env.TO_CITY || "",
+      DATE_OF_JOURNEY: process.env.DATE_OF_JOURNEY || "",
+      // CHANGED: Converted to lowercase for case-insensitive matching
+      SEAT_CLASS: (process.env.SEAT_CLASS || "S_CHAIR").toLowerCase(),
+      NEED_SEATS: parseInt(process.env.NEED_SEATS, 10) || 1,
+      // CHANGED: Converted to lowercase for case-insensitive matching
+      TRAIN_NAME: (process.env.TRAIN_NAME || "").toLowerCase(),
+      // CHANGED: Converted to lowercase for case-insensitive matching
+      PREFERRED_COACHES: process.env.PREFERRED_COACHES
+        ? process.env.PREFERRED_COACHES.split(",").map((c) =>
+            c.trim().toLowerCase()
+          )
+        : [],
+      PREFERRED_SEATS: process.env.PREFERRED_SEATS
+        ? process.env.PREFERRED_SEATS.split(",").map((s) => s.trim())
+        : [],
+
+      // Static config
       REQUEST_TIMEOUT: 20000,
       DEVICE_ID: "4004028937",
       REFERER: "https://eticket.railway.gov.bd/",
@@ -86,7 +98,6 @@ const readline = require("readline");
         throw e;
       }
     }
-    // NEW function with corrected logic for all cases
     function findAvailableSeats(
       seatLayoutResponse,
       needed,
@@ -95,109 +106,48 @@ const readline = require("readline");
     ) {
       const seatLayout = seatLayoutResponse?.data?.seatLayout;
       if (!seatLayout) return [];
-
       const availableSeats = [];
       const coachesHaveValue = preferredCoaches && preferredCoaches.length > 0;
       const seatsHaveValue = preferredSeats && preferredSeats.length > 0;
-
-      // Case 1: Both are specified. Find 'needed' seats from the preferred numbers within the preferred coaches.
-      if (coachesHaveValue && seatsHaveValue) {
+      // CHANGED: Coach names from the server are converted to lowercase for matching
+      const coachesToSearch = coachesHaveValue
+        ? seatLayout.filter((c) =>
+            preferredCoaches.includes((c.floor_name || "").toLowerCase())
+          )
+        : seatLayout;
+      const preferredSeatNumbers = seatsHaveValue
+        ? new Set(preferredSeats.map(String))
+        : null;
+      if (coachesHaveValue)
         log(
-          `Mode: Searching for ${needed} seats with numbers [${preferredSeats.join(
-            ", "
-          )}] in coaches [${preferredCoaches.join(", ")}]...`
+          "Mode: Searching only in preferred coaches:",
+          preferredCoaches.join(", ")
         );
-        const coachesToSearch = seatLayout.filter((c) =>
-          preferredCoaches.includes(c.floor_name)
-        );
-        const preferredSeatNumbers = new Set(preferredSeats.map(String));
-
-        for (const coach of coachesToSearch) {
-          for (const row of coach.layout) {
-            for (const seat of row) {
-              if (availableSeats.length >= needed) return availableSeats;
-              const seatNumPart = seat.seat_number.split("-")[1];
-              if (
-                seat.seat_availability === 1 &&
-                preferredSeatNumbers.has(seatNumPart)
-              ) {
-                availableSeats.push({
-                  ticket_id: seat.ticket_id,
-                  seat_number: seat.seat_number,
-                });
-              }
-            }
-          }
-        }
-        return availableSeats;
-      }
-
-      // Case 2: Only seats are specified. Find 'needed' seats from the preferred numbers in ANY coach.
-      if (seatsHaveValue) {
+      if (seatsHaveValue)
         log(
-          `Mode: Searching for ${needed} seats with numbers [${preferredSeats.join(
-            ", "
-          )}] in ANY coach...`
+          "Mode: Searching only for preferred seat numbers:",
+          preferredSeats.join(", ")
         );
-        const preferredSeatNumbers = new Set(preferredSeats.map(String));
-        for (const coach of seatLayout) {
-          // Iterate all coaches
-          for (const row of coach.layout) {
-            for (const seat of row) {
-              if (availableSeats.length >= needed) return availableSeats;
-              const seatNumPart = seat.seat_number.split("-")[1];
-              if (
-                seat.seat_availability === 1 &&
-                preferredSeatNumbers.has(seatNumPart)
-              ) {
-                availableSeats.push({
-                  ticket_id: seat.ticket_id,
-                  seat_number: seat.seat_number,
-                });
-              }
-            }
-          }
-        }
-        return availableSeats;
-      }
 
-      // Case 3: Only coaches are specified. Find any 'needed' seats in preferred coaches.
-      if (coachesHaveValue) {
-        log(
-          `Mode: Searching for any ${needed} seats in preferred coaches [${preferredCoaches.join(
-            ", "
-          )}]...`
-        );
-        const coachesToSearch = seatLayout.filter((c) =>
-          preferredCoaches.includes(c.floor_name)
-        );
-        for (const coach of coachesToSearch) {
-          for (const row of coach.layout) {
-            for (const seat of row) {
-              if (availableSeats.length >= needed) return availableSeats;
-              if (seat.seat_availability === 1 && seat.seat_number) {
-                availableSeats.push({
-                  ticket_id: seat.ticket_id,
-                  seat_number: seat.seat_number,
-                });
-              }
-            }
-          }
-        }
-        return availableSeats;
-      }
-
-      // Case 4: Neither is specified. Find any 'needed' seats in any coach.
-      log(`Mode: Searching for any ${needed} available seats...`);
-      for (const coach of seatLayout) {
+      for (const coach of coachesToSearch) {
         for (const row of coach.layout) {
           for (const seat of row) {
             if (availableSeats.length >= needed) return availableSeats;
             if (seat.seat_availability === 1 && seat.seat_number) {
-              availableSeats.push({
-                ticket_id: seat.ticket_id,
-                seat_number: seat.seat_number,
-              });
+              if (preferredSeatNumbers) {
+                const seatNumPart = seat.seat_number.split("-")[1];
+                if (preferredSeatNumbers.has(seatNumPart)) {
+                  availableSeats.push({
+                    ticket_id: seat.ticket_id,
+                    seat_number: seat.seat_number,
+                  });
+                }
+              } else {
+                availableSeats.push({
+                  ticket_id: seat.ticket_id,
+                  seat_number: seat.seat_number,
+                });
+              }
             }
           }
         }
@@ -209,7 +159,8 @@ const readline = require("readline");
       for (const t of trains) {
         if (!Array.isArray(t.seat_types)) continue;
         for (const st of t.seat_types) {
-          if (String(st.type).toUpperCase() === seatClass.toUpperCase()) {
+          // CHANGED: Seat class from the server is converted to lowercase for matching
+          if ((st.type || "").toLowerCase() === seatClass) {
             if (st.seat_counts.online >= neededSeats) {
               log(
                 `Found train "${t.trip_number}" with ${st.seat_counts.online} available seats.`
@@ -261,8 +212,9 @@ const readline = require("readline");
 
     if (CONFIG.TRAIN_NAME) {
       log(`Filtering for train: "${CONFIG.TRAIN_NAME}"`);
+      // CHANGED: Train name from the server is converted to lowercase for matching
       trains = trains.filter((train) =>
-        train.trip_number.includes(CONFIG.TRAIN_NAME)
+        (train.trip_number || "").toLowerCase().includes(CONFIG.TRAIN_NAME)
       );
       if (trains.length === 0)
         fatal(`The specified train "${CONFIG.TRAIN_NAME}" was not found.`);
@@ -287,20 +239,17 @@ const readline = require("readline");
       token,
       "get"
     );
-
     const availableSeats = findAvailableSeats(
       r.data,
       CONFIG.NEED_SEATS,
       CONFIG.PREFERRED_COACHES,
       CONFIG.PREFERRED_SEATS
     );
-
     if (availableSeats.length < CONFIG.NEED_SEATS) {
       fatal(
         `Could not find enough seats matching your preferences. Found ${availableSeats.length}, needed ${CONFIG.NEED_SEATS}.`
       );
     }
-
     const seatNumbers = availableSeats.map((s) => s.seat_number).join(", ");
     const reserved = availableSeats.map((s) => s.ticket_id);
     log(`Found ${availableSeats.length} seats: ${seatNumbers}`);
