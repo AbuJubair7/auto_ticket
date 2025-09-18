@@ -428,7 +428,7 @@ require("dotenv").config();
       visa_type: nullsArray,
     };
     r = await axiosReq(ENDPOINTS.CONFIRM, confirmPayload, token, "patch");
-    if (!r?.data?.data?.redirectUrl)
+    if (r.status !== 200 || !r?.data?.data?.redirectUrl)
       throw new Error(
         `Could not get payment URL. Response: ${JSON.stringify(r.data)}`
       );

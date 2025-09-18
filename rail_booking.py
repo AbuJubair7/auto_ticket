@@ -30,16 +30,22 @@ except Exception:
     pass
 
 # ---------------- helpers ----------------
+
+class BookingError(Exception):
+    """Custom exception for booking failures, carrying details for logging."""
+    def __init__(self, message, details=None):
+        super().__init__(message)
+        self.details = details
+
 def log(*args):
+    """Prints a standard log message."""
     print("[rail]", *args)
 
 
 def fatal(msg: str, data: Any = None):
     """
-    Print fatal message and, if `data` supplied, also print details as JSON
-    similar to the Node.js behavior:
-      [rail][FATAL] <msg>
-      [rail][DETAILS] <json...>
+    Prints a fatal error message and exits the script.
+    If `data` is supplied, it's printed as JSON for detailed diagnostics.
     """
     print("[rail][FATAL]", msg, file=sys.stderr)
     if data is not None:
@@ -47,12 +53,13 @@ def fatal(msg: str, data: Any = None):
             print("[rail][DETAILS]", file=sys.stderr)
             print(json.dumps(data, indent=2, ensure_ascii=False), file=sys.stderr)
         except Exception:
-            # fallback to repr if JSON serialization fails
+            # Fallback to repr if JSON serialization fails
             print("[rail][DETAILS]", repr(data), file=sys.stderr)
     sys.exit(1)
 
 
 def parse_list_env(name: str) -> List[str]:
+    """Parses a comma-separated string from an environment variable into a list."""
     v = os.getenv(name, "") or ""
     if not v:
         return []
@@ -60,6 +67,7 @@ def parse_list_env(name: str) -> List[str]:
 
 
 def parse_int_like_list_env(name: str) -> List[str]:
+    """Parses a comma-separated list of numbers-as-strings from an env variable."""
     v = os.getenv(name, "") or ""
     if not v:
         return []
@@ -67,6 +75,7 @@ def parse_int_like_list_env(name: str) -> List[str]:
 
 
 def session_headers(token: Optional[str] = None) -> Dict[str, str]:
+    """Constructs the necessary HTTP headers for API requests."""
     headers = {
         "Accept": "application/json",
         "Content-Type": "application/json",
@@ -80,6 +89,9 @@ def session_headers(token: Optional[str] = None) -> Dict[str, str]:
 
 
 def http_req(session: requests.Session, method: str, url: str, token: Optional[str] = None, params: Any = None, json_body: Any = None):
+    """
+    Makes an HTTP request and handles potential network errors and response parsing.
+    """
     headers = session_headers(token)
     timeout = CONFIG.get("REQUEST_TIMEOUT", 20)
     try:
@@ -93,23 +105,22 @@ def http_req(session: requests.Session, method: str, url: str, token: Optional[s
             raise ValueError("Unsupported method: " + method)
     except requests.RequestException as e:
         raise RuntimeError(f"Network error for {url}: {e}")
+    
     try:
         body = r.json()
-    except Exception:
+    except json.JSONDecodeError:
         body = r.text
     return r.status_code, body
 
 
 def is_available_flag(val):
+    """Checks if a seat availability flag is positive."""
     return val is True or val == 1 or val == "1"
 
 
 def find_available_seats(seat_layout_resp: Dict[str, Any], needed: int, preferred_coaches: List[str], preferred_seats: List[str]):
-    seat_layout = None
-    try:
-        seat_layout = seat_layout_resp.get("data", {}).get("seatLayout")
-    except Exception:
-        seat_layout = None
+    """Finds available seats based on user preferences."""
+    seat_layout = seat_layout_resp.get("data", {}).get("seatLayout")
     if not seat_layout:
         return []
 
@@ -134,9 +145,7 @@ def find_available_seats(seat_layout_resp: Dict[str, Any], needed: int, preferre
             for seat in row or []:
                 if len(available) >= needed:
                     return available[:needed]
-                if not seat:
-                    continue
-                if not is_available_flag(seat.get("seat_availability")):
+                if not seat or not is_available_flag(seat.get("seat_availability")):
                     continue
                 sn = str(seat.get("seat_number") or "").strip()
                 if not sn:
@@ -145,12 +154,11 @@ def find_available_seats(seat_layout_resp: Dict[str, Any], needed: int, preferre
                 if seat_set and seat_num_part not in seat_set:
                     continue
                 available.append({"ticket_id": seat.get("ticket_id"), "seat_number": sn})
-                if len(available) >= needed:
-                    return available[:needed]
     return available[:needed]
 
 
 def find_trip_for_seat_class(trains: List[Dict[str, Any]], seat_class: str, needed_seats: int):
+    """Finds a suitable train trip that has enough available seats."""
     if not trains:
         return None
     for t in trains:
@@ -160,7 +168,7 @@ def find_trip_for_seat_class(trains: List[Dict[str, Any]], seat_class: str, need
             if str(st.get("type") or "").lower() == str(seat_class).lower():
                 try:
                     online = int(st.get("seat_counts", {}).get("online", 0))
-                except Exception:
+                except (ValueError, TypeError):
                     online = 0
                 if online >= int(needed_seats):
                     log(f'Found train "{t.get("trip_number")}" with {online} available seats.')
@@ -176,42 +184,49 @@ def find_trip_for_seat_class(trains: List[Dict[str, Any]], seat_class: str, need
 
 
 # ---------------- CONFIG ----------------
-REQUIRED_ENV = ["MOBILE", "PASSWORD", "FROM_CITY", "TO_CITY", "DATE_OF_JOURNEY", "SEAT_CLASS", "NEED_SEATS"]
-missing = [k for k in REQUIRED_ENV if (os.getenv(k) or "").strip() == ""]
-if missing:
-    print("[rail][FATAL] Missing required environment variables:", ", ".join(missing), file=sys.stderr)
-    sys.exit(1)
+try:
+    REQUIRED_ENV = ["MOBILE", "PASSWORD", "FROM_CITY", "TO_CITY", "DATE_OF_JOURNEY", "SEAT_CLASS", "NEED_SEATS"]
+    missing = [k for k in REQUIRED_ENV if not (os.getenv(k) or "").strip()]
+    if missing:
+        # No need to raise an exception here, fatal is fine as no state needs cleanup.
+        fatal("Missing required environment variables:", ", ".join(missing))
 
-CONFIG = {
-    "MOBILE": os.getenv("MOBILE", ""),
-    "PASSWORD": os.getenv("PASSWORD", ""),
-    "FROM_CITY": os.getenv("FROM_CITY", ""),
-    "TO_CITY": os.getenv("TO_CITY", ""),
-    "DATE_OF_JOURNEY": os.getenv("DATE_OF_JOURNEY", ""),
-    "SEAT_CLASS": (os.getenv("SEAT_CLASS", "") or "").lower(),
-    "NEED_SEATS": int(os.getenv("NEED_SEATS", "1")),
-    "TRAIN_NAME": (os.getenv("TRAIN_NAME", "") or "").lower(),
-    "PREFERRED_COACHES": parse_list_env("PREFERRED_COACHES"),
-    "PREFERRED_SEATS": parse_int_like_list_env("PREFERRED_SEATS"),
-    "REQUEST_TIMEOUT": int(os.getenv("REQUEST_TIMEOUT", "20")),
-    "DEVICE_ID": os.getenv("DEVICE_ID", "4004028937"),
-    "REFERER": os.getenv("REFERER", "https://eticket.railway.gov.bd/"),
-    "BASE": os.getenv("BASE", "https://railspaapi.shohoz.com/v1.0/web"),
-}
+    CONFIG = {
+        "MOBILE": os.getenv("MOBILE", ""),
+        "PASSWORD": os.getenv("PASSWORD", ""),
+        "FROM_CITY": os.getenv("FROM_CITY", ""),
+        "TO_CITY": os.getenv("TO_CITY", ""),
+        "DATE_OF_JOURNEY": os.getenv("DATE_OF_JOURNEY", ""),
+        "SEAT_CLASS": (os.getenv("SEAT_CLASS", "") or "").lower(),
+        "NEED_SEATS": int(os.getenv("NEED_SEATS", "1")),
+        "TRAIN_NAME": (os.getenv("TRAIN_NAME", "") or "").lower(),
+        "PREFERRED_COACHES": parse_list_env("PREFERRED_COACHES"),
+        "PREFERRED_SEATS": parse_int_like_list_env("PREFERRED_SEATS"),
+        "REQUEST_TIMEOUT": int(os.getenv("REQUEST_TIMEOUT", "20")),
+        "DEVICE_ID": os.getenv("DEVICE_ID", "4004028937"),
+        "REFERER": os.getenv("REFERER", "https://eticket.railway.gov.bd/"),
+        "BASE": os.getenv("BASE", "https://railspaapi.shohoz.com/v1.0/web"),
+    }
 
-ENDPOINTS = {
-    "SIGNIN": f"{CONFIG['BASE']}/auth/sign-in",
-    "SEARCH": f"{CONFIG['BASE']}/bookings/search-trips-v2",
-    "SEAT_LAYOUT": f"{CONFIG['BASE']}/bookings/seat-layout",
-    "RESERVE": f"{CONFIG['BASE']}/bookings/reserve-seat",
-    "RELEASE_SEAT": f"{CONFIG['BASE']}/bookings/release-seat",
-    "PASSENGER_DETAILS": f"{CONFIG['BASE']}/bookings/passenger-details",
-    "VERIFY_OTP": f"{CONFIG['BASE']}/bookings/verify-otp",
-    "CONFIRM": f"{CONFIG['BASE']}/bookings/confirm",
-}
+    ENDPOINTS = {
+        "SIGNIN": f"{CONFIG['BASE']}/auth/sign-in",
+        "SEARCH": f"{CONFIG['BASE']}/bookings/search-trips-v2",
+        "SEAT_LAYOUT": f"{CONFIG['BASE']}/bookings/seat-layout",
+        "RESERVE": f"{CONFIG['BASE']}/bookings/reserve-seat",
+        "RELEASE_SEAT": f"{CONFIG['BASE']}/bookings/release-seat",
+        "PASSENGER_DETAILS": f"{CONFIG['BASE']}/bookings/passenger-details",
+        "VERIFY_OTP": f"{CONFIG['BASE']}/bookings/verify-otp",
+        "CONFIRM": f"{CONFIG['BASE']}/bookings/confirm",
+    }
+except ValueError as e:
+    fatal("Configuration error: A numeric value in your environment variables is invalid.", str(e))
+except Exception as e:
+    fatal("An unexpected error occurred during initialization.", str(e))
+
 
 # ---------------- main flow ----------------
 def main():
+    """Main function to execute the booking flow."""
     session = requests.Session()
     token = None
     trip = None
@@ -221,20 +236,20 @@ def main():
     try:
         log("STARTING flow")
 
-        # 1) sign in
+        # 1) Sign in
         log("1) Signing in...")
         status, body = http_req(session, "post", ENDPOINTS["SIGNIN"], json_body={
             "mobile_number": CONFIG["MOBILE"],
             "password": CONFIG["PASSWORD"],
         })
-        if status < 200 or status >= 300:
-            fatal("Sign-in failed", body)
+        if status != 200:
+            raise BookingError("Sign-in failed", body)
         token = (body.get("data") or {}).get("token") if isinstance(body, dict) else None
         if not token:
-            fatal("Sign-in failed (no token)", body)
+            raise BookingError("Sign-in failed (no token)", body)
         log("Signed in.")
 
-        # 2) search trips
+        # 2) Search trips
         log(f'2) Searching trips {CONFIG["FROM_CITY"]} -> {CONFIG["TO_CITY"]}...')
         status, body = http_req(session, "get", ENDPOINTS["SEARCH"], token=token, params={
             "from_city": CONFIG["FROM_CITY"],
@@ -242,60 +257,58 @@ def main():
             "date_of_journey": CONFIG["DATE_OF_JOURNEY"],
             "seat_class": CONFIG["SEAT_CLASS"],
         })
-        if status < 200 or status >= 300:
-            fatal("Search failed", body)
-        trains = (body.get("data") or {}).get("trains") if isinstance(body, dict) else None
+        if status != 200:
+            raise BookingError("Search failed", body)
+        trains = (body.get("data") or {}).get("trains") if isinstance(body, dict) else []
         if not trains:
-            fatal("No trains found for this route.", body)
+            raise BookingError("No trains found for this route.", body)
 
-        # optional train name filter (substring match)
         if CONFIG["TRAIN_NAME"]:
             trains = [t for t in trains if CONFIG["TRAIN_NAME"] in str(t.get("trip_number") or "").lower()]
             if not trains:
-                fatal(f'The specified train "{CONFIG["TRAIN_NAME"]}" was not found.', body)
+                raise BookingError(f'The specified train "{CONFIG["TRAIN_NAME"]}" was not found.', body)
 
         trip = find_trip_for_seat_class(trains, CONFIG["SEAT_CLASS"], CONFIG["NEED_SEATS"])
         if not trip:
-            fatal(f'No train found with at least {CONFIG["NEED_SEATS"]} available seats of class "{CONFIG["SEAT_CLASS"]}".', body)
+            raise BookingError(f'No train found with at least {CONFIG["NEED_SEATS"]} available seats of class "{CONFIG["SEAT_CLASS"]}".', body)
         log("Selected trip:", trip.get("train_label"))
 
-        # 3) seat layout
+        # 3) Get seat layout
         log("3) Fetching and filtering seat layout...")
         status, seat_layout_resp = http_req(session, "get", ENDPOINTS["SEAT_LAYOUT"], token=token, params={
             "trip_id": trip["trip_id"],
             "trip_route_id": trip["trip_route_id"]
         })
-        if status < 200 or status >= 300:
-            fatal("Seat layout fetch failed", seat_layout_resp)
+        if status != 200:
+            raise BookingError("Seat layout fetch failed", seat_layout_resp)
 
         available_seats = find_available_seats(seat_layout_resp, CONFIG["NEED_SEATS"], CONFIG["PREFERRED_COACHES"], CONFIG["PREFERRED_SEATS"])
         if len(available_seats) < CONFIG["NEED_SEATS"]:
-            details = seat_layout_resp if isinstance(seat_layout_resp, dict) else None
-            fatal(f"Could not find enough seats matching preferences. Found {len(available_seats)}, needed {CONFIG['NEED_SEATS']}.", details)
+            raise BookingError(f"Could not find enough seats matching preferences. Found {len(available_seats)}, needed {CONFIG['NEED_SEATS']}.", seat_layout_resp)
 
         seat_numbers = ", ".join([s["seat_number"] for s in available_seats])
         ticket_ids = [s["ticket_id"] for s in available_seats]
         log(f'Found {len(available_seats)} seats: {seat_numbers}')
 
-        # 4) reserve each ticket
+        # 4) Reserve each ticket
         log("4) Reserving seats...")
         for tid in ticket_ids:
             status, resp = http_req(session, "patch", ENDPOINTS["RESERVE"], token=token, json_body={"ticket_id": tid, "route_id": trip["trip_route_id"]})
-            if status >= 300 or (isinstance(resp, dict) and resp.get("data", {}).get("error")):
-                fatal(f"Failed to reserve ticket ID {tid}.", resp)
+            if status != 200 or (isinstance(resp, dict) and resp.get("data", {}).get("error")):
+                raise BookingError(f"Failed to reserve ticket ID {tid}.", resp)
             log(f"  - Successfully reserved ticket ID: {tid}")
             successfully_reserved.append(tid)
         log(f"Successfully reserved all {len(successfully_reserved)} seats.")
 
-        # 5) trigger OTP
+        # 5) Trigger OTP
         log("5) Triggering OTP send...")
         passenger_payload = {"trip_id": trip["trip_id"], "trip_route_id": trip["trip_route_id"], "ticket_ids": successfully_reserved}
         status, resp = http_req(session, "post", ENDPOINTS["PASSENGER_DETAILS"], token=token, json_body=passenger_payload)
-        if status < 200 or status >= 300 or not (isinstance(resp, dict) and resp.get("data", {}).get("success")):
-            fatal("API error while triggering OTP", resp)
+        if status != 200 or not (isinstance(resp, dict) and resp.get("data", {}).get("success")):
+            raise BookingError("API error while triggering OTP", resp)
         log(f'OTP sent to your phone: "{resp.get("data", {}).get("msg")}"')
 
-        # OTP loop (up to 3 attempts)
+        # 6) Verify OTP
         otp_verified = False
         main_passenger = None
         last_otp_resp = None
@@ -304,12 +317,12 @@ def main():
             if not otp_input or not re.match(r"^\d{4,6}$", otp_input):
                 log("Invalid OTP format. Please try again.")
                 continue
-            log(f"6) Verifying OTP (Attempt {attempt}/3)...")
+            log(f"Verifying OTP (Attempt {attempt}/3)...")
             otp_payload = dict(passenger_payload)
             otp_payload["otp"] = otp_input
             status, otp_resp = http_req(session, "post", ENDPOINTS["VERIFY_OTP"], token=token, json_body=otp_payload)
             last_otp_resp = otp_resp
-            if status >= 200 and status < 300 and isinstance(otp_resp, dict) and otp_resp.get("data", {}).get("success"):
+            if status == 200 and isinstance(otp_resp, dict) and otp_resp.get("data", {}).get("success"):
                 main_passenger = otp_resp["data"].get("user")
                 log("✅ OTP Verified for user:", main_passenger.get("name"))
                 otp_verified = True
@@ -317,10 +330,9 @@ def main():
             else:
                 log("Incorrect OTP. Please try again.")
         if not otp_verified:
-            details = last_otp_resp if isinstance(last_otp_resp, dict) else None
-            fatal("OTP verification failed after 3 attempts.", details)
+            raise BookingError("OTP verification failed after 3 attempts.", last_otp_resp)
 
-        # build passenger details
+        # 7) Get passenger details
         passenger_details = {"pname": [main_passenger.get("name")], "passengerType": ["Adult"], "gender": ["male"]}
         if CONFIG["NEED_SEATS"] > 1:
             log(f'Please enter details for the other {CONFIG["NEED_SEATS"] - 1} passenger(s).')
@@ -332,29 +344,25 @@ def main():
                 passenger_details["passengerType"].append(ptype)
                 passenger_details["gender"].append(gender)
 
-        # review
+        # 8) Review and confirm
         print("\n===== PLEASE REVIEW YOUR BOOKING DETAILS =====")
-        print("Train:         ", trip.get("train_label"))
-        print("From:          ", CONFIG["FROM_CITY"])
-        print("To:            ", CONFIG["TO_CITY"])
-        print("Date:          ", CONFIG["DATE_OF_JOURNEY"])
-        print("Class:         ", CONFIG["SEAT_CLASS"])
-        print("Total Seats:   ", len(available_seats))
-        print("Seat Numbers:  ", seat_numbers)
+        print(f"Train:          {trip.get('train_label')}")
+        print(f"From:           {CONFIG['FROM_CITY']}")
+        print(f"To:             {CONFIG['TO_CITY']}")
+        print(f"Date:           {CONFIG['DATE_OF_JOURNEY']}")
+        print(f"Class:          {CONFIG['SEAT_CLASS']}")
+        print(f"Total Seats:    {len(available_seats)}")
+        print(f"Seat Numbers:   {seat_numbers}")
         print("\nPassengers:")
         for i, nm in enumerate(passenger_details["pname"]):
             print(f"  - {nm} ({passenger_details['passengerType'][i]}, {passenger_details['gender'][i]})")
 
-        confirm = input("Proceed to payment? (yes/no): ").strip().lower()
+        confirm = input("\nProceed to payment? (yes/no): ").strip().lower()
         if confirm not in ("yes", "y"):
-            fatal("Booking cancelled by user.")
+            raise BookingError("Booking cancelled by user.")
 
-        # confirm booking
+        # 9) Confirm booking to get payment link
         log("9) Confirming booking to get payment link...")
-        seats_count = len(passenger_details["pname"])
-        nulls = [None] * seats_count
-        empty_strs = [""] * seats_count
-
         confirm_payload = {
             **passenger_payload,
             "otp": otp_payload["otp"],
@@ -364,92 +372,69 @@ def main():
             "gender": passenger_details["gender"],
             "pemail": main_passenger.get("email"),
             "pmobile": main_passenger.get("mobile"),
-            "contactperson": 0,
-            "enable_sms_alert": 0,
-            "seat_class": CONFIG["SEAT_CLASS"],
-            "from_city": CONFIG["FROM_CITY"],
-            "to_city": CONFIG["TO_CITY"],
-            "date_of_journey": CONFIG["DATE_OF_JOURNEY"],
             "is_bkash_online": True,
-            "selected_mobile_transaction": 1,
-            "date_of_birth": nulls,
-            "first_name": nulls,
-            "last_name": nulls,
-            "middle_name": nulls,
-            "nationality": nulls,
-            "page": empty_strs,
-            "ppassport": empty_strs,
-            "passport_expiry_date": nulls,
-            "passport_no": empty_strs,
-            "passport_type": nulls,
-            "visa_expire_date": nulls,
-            "visa_issue_date": nulls,
-            "visa_issue_place": nulls,
-            "visa_no": nulls,
-            "visa_type": nulls,
         }
         status, resp = http_req(session, "patch", ENDPOINTS["CONFIRM"], token=token, json_body=confirm_payload)
-        if status < 200 or status >= 300:
-            fatal("Confirm booking failed", resp)
+        if status != 200:
+            raise BookingError("Confirm booking failed", resp)
         redirect_url = (resp.get("data") or {}).get("redirectUrl") if isinstance(resp, dict) else None
         if not redirect_url:
-            fatal("Could not get payment URL from confirmation response", resp)
+            raise BookingError("Could not get payment URL from confirmation response", resp)
 
         log("✅ Booking Confirmed!")
-        log("Opening payment link in your browser:", redirect_url)
+        log("Opening payment link in your browser...")
         try:
             webbrowser.open(redirect_url)
         except Exception:
             log("Could not open browser automatically. Payment URL:", redirect_url)
         log("Please complete payment in your browser.")
-        sys.exit(0)
+
+    except BookingError as e:
+        if successfully_reserved:
+            log(f"An error occurred: {e}. Attempting to release {len(successfully_reserved)} reserved seat(s)...")
+            for tid in successfully_reserved:
+                try:
+                    if trip:
+                        http_req(session, "patch", ENDPOINTS["RELEASE_SEAT"], token=token, json_body={"ticket_id": tid, "route_id": trip["trip_route_id"]})
+                        log(f"  - Released ticket ID: {tid}")
+                    else:
+                        log(f"  - Cannot release ticket ID {tid}: trip info is missing.")
+                except Exception as release_exc:
+                    log(f"  - Failed to release ticket ID {tid}: {release_exc}")
+            log("Release attempts finished.")
+
+        short_msg = str(e)
+        details = e.details
+        if isinstance(details, dict) and details.get("error"):
+            error_data = details.get("error", {})
+            code = error_data.get("code", "N/A")
+            messages = error_data.get("messages")
+            first_msg = (messages[0] if isinstance(messages, list) and messages else "Unknown server error")
+            short_msg = f"Booking failed — code {code}: {first_msg}"
+        fatal(short_msg, details)
 
     except Exception as e:
-        # rollback: release reserved seats individually (don't fail whole flow)
-        try:
-            if successfully_reserved:
-                log(f"Attempting to release {len(successfully_reserved)} reserved seat(s)...")
-                for tid in successfully_reserved:
-                    try:
-                        log(f"  - Releasing ticket ID: {tid}")
-                        if not ENDPOINTS.get("RELEASE_SEAT"):
-                            log("    - RELEASE_SEAT endpoint not configured; skipping release.")
-                            continue
-                        if not trip or not trip.get("trip_route_id"):
-                            log("    - trip or trip_route_id missing; cannot release ticket, skipping.")
-                            continue
-                        status, rel_resp = http_req(session, "patch", ENDPOINTS["RELEASE_SEAT"], token=token, json_body={"ticket_id": tid, "route_id": trip["trip_route_id"]})
-                        if status >= 300:
-                            log(f"    - Release request for {tid} returned status {status}")
-                        else:
-                            log(f"    - Released {tid}")
-                    except Exception as release_exc:
-                        log(f"    - Failed to release {tid}: {release_exc}")
-                log("Release attempts finished.")
-        except Exception as re_outer:
-            log("Error while attempting releases:", re_outer)
+        if successfully_reserved:
+            log(f"An unexpected error occurred: {e}. Attempting to release {len(successfully_reserved)} reserved seat(s)...")
+            for tid in successfully_reserved:
+                try:
+                    if trip:
+                        http_req(session, "patch", ENDPOINTS["RELEASE_SEAT"], token=token, json_body={"ticket_id": tid, "route_id": trip["trip_route_id"]})
+                        log(f"  - Released ticket ID: {tid}")
+                    else:
+                        log(f"  - Cannot release ticket ID {tid}: trip info is missing.")
+                except Exception as release_exc:
+                    log(f"  - Failed to release ticket ID {tid}: {release_exc}")
+            log("Release attempts finished.")
 
-        # prepare short error message (code + first message) if server details exist
-        details = getattr(e, "details", None)
-        if isinstance(details, dict) and details.get("error"):
-            code = details["error"].get("code")
-            first_msg = None
-            msgs = details["error"].get("messages")
-            if isinstance(msgs, list) and msgs:
-                first_msg = msgs[0]
-            short_msg = f"Booking failed — code {code}: {first_msg or 'Unknown error'}"
-            # print both short message and full details (like Node.js)
-            fatal(short_msg, details)
-        else:
-            # fallback: show exception message and, if possible, include any response body
-            attached = None
-            if hasattr(e, "args") and len(e.args) > 1 and isinstance(e.args[1], dict):
-                attached = e.args[1]
-            fatal(str(e), attached)
+        fatal(f"An unexpected runtime error occurred: {e}")
 
 
 if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        fatal("Interrupted by user")
+        fatal("Interrupted by user. Exiting.")
+    except Exception as e:
+        fatal(f"An unhandled critical error occurred: {e}", getattr(e, 'details', None))
+
