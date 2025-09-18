@@ -1,197 +1,194 @@
 /**
  * rail_booking.js
- * Final version: Makes all filtering from the config file case-insensitive.
+ * Final version: Improved error handling, robust rollback, OTP scope fixes, and cleanup.
  */
 
 const axios = require("axios");
 const readline = require("readline");
-require("dotenv").config(); // Loads environment variables from .env file
+require("dotenv").config();
 
 // --- Main Script Flow ---
 (async function main() {
-  try {
-    const open = (await import("open")).default;
+  const open = (await import("open")).default;
 
-    const CONFIG = {
-      MOBILE: process.env.MOBILE || "",
-      PASSWORD: process.env.PASSWORD || "",
-      FROM_CITY: process.env.FROM_CITY || "",
-      TO_CITY: process.env.TO_CITY || "",
-      DATE_OF_JOURNEY: process.env.DATE_OF_JOURNEY || "",
-      // CHANGED: Converted to lowercase for case-insensitive matching
-      SEAT_CLASS: (process.env.SEAT_CLASS || "S_CHAIR").toLowerCase(),
-      NEED_SEATS: parseInt(process.env.NEED_SEATS, 10) || 1,
-      // CHANGED: Converted to lowercase for case-insensitive matching
-      TRAIN_NAME: (process.env.TRAIN_NAME || "").toLowerCase(),
-      // CHANGED: Converted to lowercase for case-insensitive matching
-      PREFERRED_COACHES: process.env.PREFERRED_COACHES
-        ? process.env.PREFERRED_COACHES.split(",").map((c) =>
-            c.trim().toLowerCase()
-          )
-        : [],
-      PREFERRED_SEATS: process.env.PREFERRED_SEATS
-        ? process.env.PREFERRED_SEATS.split(",").map((s) => s.trim())
-        : [],
+  const CONFIG = {
+    MOBILE: process.env.MOBILE || "",
+    PASSWORD: process.env.PASSWORD || "",
+    FROM_CITY: process.env.FROM_CITY || "",
+    TO_CITY: process.env.TO_CITY || "",
+    DATE_OF_JOURNEY: process.env.DATE_OF_JOURNEY || "",
+    SEAT_CLASS: (process.env.SEAT_CLASS || "S_CHAIR").toLowerCase(),
+    NEED_SEATS: parseInt(process.env.NEED_SEATS, 10) || 1,
+    TRAIN_NAME: (process.env.TRAIN_NAME || "").toLowerCase(),
+    PREFERRED_COACHES: process.env.PREFERRED_COACHES
+      ? process.env.PREFERRED_COACHES.split(",").map((c) =>
+          c.trim().toLowerCase()
+        )
+      : [],
+    PREFERRED_SEATS: process.env.PREFERRED_SEATS
+      ? process.env.PREFERRED_SEATS.split(",").map((s) => s.trim())
+      : [],
+    REQUEST_TIMEOUT: 20000,
+    DEVICE_ID: "4004028937",
+    REFERER: "https://eticket.railway.gov.bd/",
+    BASE: "https://railspaapi.shohoz.com/v1.0/web",
+  };
 
-      // Static config
-      REQUEST_TIMEOUT: 20000,
-      DEVICE_ID: "4004028937",
-      REFERER: "https://eticket.railway.gov.bd/",
-      BASE: "https://railspaapi.shohoz.com/v1.0/web",
+  const ENDPOINTS = {
+    SIGNIN: `${CONFIG.BASE}/auth/sign-in`,
+    SEARCH: `${CONFIG.BASE}/bookings/search-trips-v2`,
+    SEAT_LAYOUT: `${CONFIG.BASE}/bookings/seat-layout`,
+    RESERVE: `${CONFIG.BASE}/bookings/reserve-seat`,
+    RELEASE_SEAT: `${CONFIG.BASE}/bookings/release-seat`,
+    PASSENGER_DETAILS: `${CONFIG.BASE}/bookings/passenger-details`,
+    VERIFY_OTP: `${CONFIG.BASE}/bookings/verify-otp`,
+    CONFIRM: `${CONFIG.BASE}/bookings/confirm`,
+  };
+
+  function log(...args) {
+    console.log("[rail]", ...args);
+  }
+  function fatal(err, data) {
+    console.error("[rail][FATAL]", err);
+    if (data !== undefined)
+      console.error("[rail][DETAILS]", JSON.stringify(data, null, 2));
+    process.exit(1);
+  }
+  function createReadline() {
+    return readline.createInterface({
+      input: process.stdin,
+      output: process.stdout,
+    });
+  }
+  function askQuestion(rl, query) {
+    return new Promise((resolve) =>
+      rl.question(query, (ans) => resolve(ans.trim()))
+    );
+  }
+  async function axiosReq(url, data = {}, token = null, method = "post") {
+    const headers = {
+      Accept: "application/json",
+      "Content-Type": "application/json",
+      "X-Requested-With": "XMLHttpRequest",
+      "X-Device-Id": CONFIG.DEVICE_ID,
+      Referer: CONFIG.REFERER,
     };
-
-    const ENDPOINTS = {
-      SIGNIN: `${CONFIG.BASE}/auth/sign-in`,
-      SEARCH: `${CONFIG.BASE}/bookings/search-trips-v2`,
-      SEAT_LAYOUT: `${CONFIG.BASE}/bookings/seat-layout`,
-      RESERVE: `${CONFIG.BASE}/bookings/reserve-seat`,
-      PASSENGER_DETAILS: `${CONFIG.BASE}/bookings/passenger-details`,
-      VERIFY_OTP: `${CONFIG.BASE}/bookings/verify-otp`,
-      CONFIRM: `${CONFIG.BASE}/bookings/confirm`,
-    };
-
-    // --- Helper Functions ---
-    function log(...args) {
-      console.log("[rail]", ...args);
-    }
-    function fatal(err, data) {
-      console.error("[rail][FATAL]", err);
-      if (data !== undefined)
-        console.error("[rail][DETAILS]", JSON.stringify(data, null, 2));
-      process.exit(1);
-    }
-    function createReadline() {
-      return readline.createInterface({
-        input: process.stdin,
-        output: process.stdout,
-      });
-    }
-    function askQuestion(rl, query) {
-      return new Promise((resolve) =>
-        rl.question(query, (ans) => resolve(ans.trim()))
-      );
-    }
-    async function axiosReq(url, data = {}, token = null, method = "post") {
-      const headers = {
-        Accept: "application/json",
-        "Content-Type": "application/json",
-        "X-Requested-With": "XMLHttpRequest",
-        "X-Device-Id": CONFIG.DEVICE_ID,
-        Referer: CONFIG.REFERER,
+    if (token) headers["Authorization"] = `Bearer ${token}`;
+    try {
+      const opts = {
+        url,
+        method: method.toLowerCase(),
+        headers,
+        timeout: CONFIG.REQUEST_TIMEOUT,
+        validateStatus: null,
       };
-      if (token) headers["Authorization"] = `Bearer ${token}`;
-      try {
-        const opts = {
-          url,
-          method: method.toLowerCase(),
-          headers,
-          timeout: CONFIG.REQUEST_TIMEOUT,
-          validateStatus: null,
-        };
-        if (method.toLowerCase() === "get") opts.params = data;
-        else opts.data = data;
-        const res = await axios(opts);
-        return res;
-      } catch (e) {
-        if (e.code === "ECONNABORTED")
-          throw new Error(`Request timeout for ${url}`);
-        throw e;
-      }
+      if (method.toLowerCase() === "get") opts.params = data;
+      else opts.data = data;
+      const res = await axios(opts);
+      return res;
+    } catch (e) {
+      if (e.code === "ECONNABORTED")
+        throw new Error(`Request timeout for ${url}`);
+      throw e;
     }
-    function findAvailableSeats(
-      seatLayoutResponse,
-      needed,
-      preferredCoaches,
-      preferredSeats
-    ) {
-      const seatLayout = seatLayoutResponse?.data?.seatLayout;
-      if (!seatLayout) return [];
-      const availableSeats = [];
-      const coachesHaveValue = preferredCoaches && preferredCoaches.length > 0;
-      const seatsHaveValue = preferredSeats && preferredSeats.length > 0;
-      // CHANGED: Coach names from the server are converted to lowercase for matching
-      const coachesToSearch = coachesHaveValue
-        ? seatLayout.filter((c) =>
-            preferredCoaches.includes((c.floor_name || "").toLowerCase())
-          )
-        : seatLayout;
-      const preferredSeatNumbers = seatsHaveValue
-        ? new Set(preferredSeats.map(String))
-        : null;
-      if (coachesHaveValue)
-        log(
-          "Mode: Searching only in preferred coaches:",
-          preferredCoaches.join(", ")
-        );
-      if (seatsHaveValue)
-        log(
-          "Mode: Searching only for preferred seat numbers:",
-          preferredSeats.join(", ")
-        );
-
-      for (const coach of coachesToSearch) {
-        for (const row of coach.layout) {
-          for (const seat of row) {
-            if (availableSeats.length >= needed) return availableSeats;
-            if (seat.seat_availability === 1 && seat.seat_number) {
-              if (preferredSeatNumbers) {
-                const seatNumPart = seat.seat_number.split("-")[1];
-                if (preferredSeatNumbers.has(seatNumPart)) {
-                  availableSeats.push({
-                    ticket_id: seat.ticket_id,
-                    seat_number: seat.seat_number,
-                  });
-                }
-              } else {
+  }
+  function findAvailableSeats(
+    seatLayoutResponse,
+    needed,
+    preferredCoaches,
+    preferredSeats
+  ) {
+    const seatLayout = seatLayoutResponse?.data?.seatLayout;
+    if (!seatLayout) return [];
+    const availableSeats = [];
+    const coachesHaveValue = preferredCoaches && preferredCoaches.length > 0;
+    const seatsHaveValue = preferredSeats && preferredSeats.length > 0;
+    const coachesToSearch = coachesHaveValue
+      ? seatLayout.filter((c) =>
+          preferredCoaches.includes((c.floor_name || "").toLowerCase())
+        )
+      : seatLayout;
+    const preferredSeatNumbers = seatsHaveValue
+      ? new Set(preferredSeats.map(String))
+      : null;
+    if (coachesHaveValue)
+      log(
+        "Mode: Searching only in preferred coaches:",
+        preferredCoaches.join(", ")
+      );
+    if (seatsHaveValue)
+      log(
+        "Mode: Searching only for preferred seat numbers:",
+        preferredSeats.join(", ")
+      );
+    for (const coach of coachesToSearch) {
+      for (const row of coach.layout) {
+        for (const seat of row) {
+          if (availableSeats.length >= needed) return availableSeats;
+          if (seat.seat_availability === 1 && seat.seat_number) {
+            if (preferredSeatNumbers) {
+              const seatNumPart = seat.seat_number.split("-")[1];
+              if (preferredSeatNumbers.has(seatNumPart)) {
                 availableSeats.push({
                   ticket_id: seat.ticket_id,
                   seat_number: seat.seat_number,
                 });
               }
-            }
-          }
-        }
-      }
-      return availableSeats;
-    }
-    function findTripForSeatClass(trains, seatClass, neededSeats) {
-      if (!trains) return null;
-      for (const t of trains) {
-        if (!Array.isArray(t.seat_types)) continue;
-        for (const st of t.seat_types) {
-          // CHANGED: Seat class from the server is converted to lowercase for matching
-          if ((st.type || "").toLowerCase() === seatClass) {
-            if (st.seat_counts.online >= neededSeats) {
-              log(
-                `Found train "${t.trip_number}" with ${st.seat_counts.online} available seats.`
-              );
-              return {
-                trip_id: st.trip_id,
-                trip_route_id: st.trip_route_id,
-                train_label: t.trip_number || t.train_model || null,
-                boarding_point_id: t.boarding_points[0]?.trip_point_id,
-              };
             } else {
-              log(
-                `Skipping train "${t.trip_number}": not enough seats (found ${st.seat_counts.online}, need ${neededSeats}).`
-              );
+              availableSeats.push({
+                ticket_id: seat.ticket_id,
+                seat_number: seat.seat_number,
+              });
             }
           }
         }
       }
-      return null;
     }
+    return availableSeats;
+  }
+  function findTripForSeatClass(trains, seatClass, neededSeats) {
+    if (!trains) return null;
+    for (const t of trains) {
+      if (!Array.isArray(t.seat_types)) continue;
+      for (const st of t.seat_types) {
+        if ((st.type || "").toLowerCase() === seatClass) {
+          if (st.seat_counts.online >= neededSeats) {
+            log(
+              `Found train "${t.trip_number}" with ${st.seat_counts.online} available seats.`
+            );
+            return {
+              trip_id: st.trip_id,
+              trip_route_id: st.trip_route_id,
+              train_label: t.trip_number || t.train_model || null,
+              boarding_point_id: t.boarding_points[0]?.trip_point_id,
+            };
+          } else {
+            log(
+              `Skipping train "${t.trip_number}": not enough seats (found ${st.seat_counts.online}, need ${neededSeats}).`
+            );
+          }
+        }
+      }
+    }
+    return null;
+  }
 
+  let token;
+  let trip;
+  const successfullyReserved = [];
+  let rl = null;
+  let otpPayload = null; // accessible after OTP verification
+
+  try {
     log("STARTING flow");
 
-    // Steps 1-2
     log("1) Signing in...");
     let r = await axiosReq(ENDPOINTS.SIGNIN, {
       mobile_number: CONFIG.MOBILE,
       password: CONFIG.PASSWORD,
     });
-    const token = r.data?.data?.token;
-    if (!token) fatal("Sign-in failed", r.data);
+    token = r.data?.data?.token;
+    if (!token) throw new Error("Sign-in failed (no token received)");
     log("Signed in.");
 
     log(`2) Searching trips ${CONFIG.FROM_CITY} -> ${CONFIG.TO_CITY}...`);
@@ -208,30 +205,23 @@ require("dotenv").config(); // Loads environment variables from .env file
     );
     let trains = r.data?.data?.trains;
     if (!trains || trains.length === 0)
-      fatal("No trains found for this route.", r.data);
-
+      throw new Error("No trains found for this route.");
     if (CONFIG.TRAIN_NAME) {
-      log(`Filtering for train: "${CONFIG.TRAIN_NAME}"`);
-      // CHANGED: Train name from the server is converted to lowercase for matching
       trains = trains.filter((train) =>
         (train.trip_number || "").toLowerCase().includes(CONFIG.TRAIN_NAME)
       );
       if (trains.length === 0)
-        fatal(`The specified train "${CONFIG.TRAIN_NAME}" was not found.`);
+        throw new Error(
+          `The specified train "${CONFIG.TRAIN_NAME}" was not found.`
+        );
     }
-
-    const trip = findTripForSeatClass(
-      trains,
-      CONFIG.SEAT_CLASS,
-      CONFIG.NEED_SEATS
-    );
+    trip = findTripForSeatClass(trains, CONFIG.SEAT_CLASS, CONFIG.NEED_SEATS);
     if (!trip)
-      fatal(
+      throw new Error(
         `No train found with at least ${CONFIG.NEED_SEATS} available seats of class "${CONFIG.SEAT_CLASS}".`
       );
     log("Selected trip:", trip.train_label);
 
-    // Step 3: Find available seats
     log("3) Fetching and filtering seat layout...");
     r = await axiosReq(
       ENDPOINTS.SEAT_LAYOUT,
@@ -245,35 +235,52 @@ require("dotenv").config(); // Loads environment variables from .env file
       CONFIG.PREFERRED_COACHES,
       CONFIG.PREFERRED_SEATS
     );
+
+    // =================================================================
+    // MODIFIED ERROR LOGIC STARTS HERE
+    // =================================================================
     if (availableSeats.length < CONFIG.NEED_SEATS) {
-      fatal(
-        `Could not find enough seats matching your preferences. Found ${availableSeats.length}, needed ${CONFIG.NEED_SEATS}.`
+      const error = new Error(
+        `Could not find enough seats matching preferences. Found ${availableSeats.length}, needed ${CONFIG.NEED_SEATS}.`
       );
+      // Attach the full server response to the error for better debugging
+      error.details = r.data;
+      throw error;
     }
+    // =================================================================
+    // MODIFIED ERROR LOGIC ENDS HERE
+    // =================================================================
+
     const seatNumbers = availableSeats.map((s) => s.seat_number).join(", ");
-    const reserved = availableSeats.map((s) => s.ticket_id);
+    const ticketIdsToReserve = availableSeats.map((s) => s.ticket_id);
     log(`Found ${availableSeats.length} seats: ${seatNumbers}`);
 
-    // Step 4-10...
     log("4) Reserving seats...");
-    for (const tid of reserved) {
+    for (const tid of ticketIdsToReserve) {
       r = await axiosReq(
         ENDPOINTS.RESERVE,
         { ticket_id: tid, route_id: trip.trip_route_id },
         token,
         "patch"
       );
-      if (r.status >= 300 || r.data?.data?.error)
-        fatal(`Reserve-seat failed for ${tid}`, r.data);
+      if (r.status >= 300 || r.data?.data?.error) {
+        throw new Error(
+          `Failed to reserve ticket ID ${tid}. Reason: ${JSON.stringify(
+            r.data
+          )}`
+        );
+      }
+      log(`  - Successfully reserved ticket ID: ${tid}`);
+      successfullyReserved.push(tid);
     }
-    log(`Reserved ${reserved.length} seats.`);
+    log(`Successfully reserved all ${successfullyReserved.length} seats.`);
 
-    const rl = createReadline();
+    rl = createReadline();
     log("5) Triggering OTP send...");
     const passengerPayload = {
       trip_id: trip.trip_id,
       trip_route_id: trip.trip_route_id,
-      ticket_ids: reserved,
+      ticket_ids: successfullyReserved,
     };
     r = await axiosReq(
       ENDPOINTS.PASSENGER_DETAILS,
@@ -282,18 +289,46 @@ require("dotenv").config(); // Loads environment variables from .env file
       "post"
     );
     if (!r?.data?.data?.success)
-      fatal("API error while triggering OTP", r.data);
+      throw new Error(
+        `API error while triggering OTP: ${JSON.stringify(r.data)}`
+      );
     log(`OTP sent to your phone: "${r.data.data.msg}"`);
 
-    const otp = await askQuestion(rl, "Please enter the OTP you received: ");
-    if (!otp || !/^\d{4,6}$/.test(otp)) fatal("Invalid OTP entered.");
-
-    log(`6) Verifying OTP...`);
-    const otpPayload = { ...passengerPayload, otp };
-    r = await axiosReq(ENDPOINTS.VERIFY_OTP, otpPayload, token, "post");
-    if (!r.data?.data?.success) fatal("OTP verification failed", r.data.data);
-    const mainPassenger = r.data.data.user;
-    log("OTP Verified for user:", mainPassenger.name);
+    let otpVerified = false;
+    let mainPassenger;
+    let lastOtpError = null;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      const otp = await askQuestion(
+        rl,
+        `Please enter the OTP you received (Attempt ${attempt}/3): `
+      );
+      if (!otp || !/^\d{4,6}$/.test(otp)) {
+        log("Invalid OTP format. Please try again.");
+        continue;
+      }
+      log(`6) Verifying OTP (Attempt ${attempt}/3)...`);
+      // store otpPayload in outer scope so we can use it later
+      otpPayload = { ...passengerPayload, otp };
+      r = await axiosReq(ENDPOINTS.VERIFY_OTP, otpPayload, token, "post");
+      if (r.data?.data?.success) {
+        mainPassenger = r.data.data.user;
+        log("✅ OTP Verified for user:", mainPassenger.name);
+        otpVerified = true;
+        break;
+      } else {
+        lastOtpError = r.data;
+        if (attempt < 3) {
+          log("Incorrect OTP. Please try again.");
+        }
+      }
+    }
+    if (!otpVerified) {
+      throw new Error(
+        `OTP verification failed after 3 attempts. Last error: ${JSON.stringify(
+          lastOtpError
+        )}`
+      );
+    }
 
     const passengerDetails = {
       pname: [mainPassenger.name],
@@ -343,12 +378,17 @@ require("dotenv").config(); // Loads environment variables from .env file
       "Proceed to payment? (yes/no): "
     );
     rl.close();
+    rl = null; // mark closed
     if (
       confirmation.toLowerCase() !== "yes" &&
       confirmation.toLowerCase() !== "y"
     ) {
-      log("Booking cancelled by user.");
-      process.exit(0);
+      throw new Error("Booking cancelled by user.");
+    }
+
+    // ensure otpPayload exists before using
+    if (!otpPayload || !otpPayload.otp) {
+      throw new Error("Internal error: OTP payload missing.");
     }
 
     log("9) Confirming booking to get payment link...");
@@ -356,7 +396,7 @@ require("dotenv").config(); // Loads environment variables from .env file
     const emptyStrArray = Array(CONFIG.NEED_SEATS).fill("");
     const confirmPayload = {
       ...passengerPayload,
-      otp,
+      otp: otpPayload.otp,
       boarding_point_id: trip.boarding_point_id,
       pname: passengerDetails.pname,
       passengerType: passengerDetails.passengerType,
@@ -379,7 +419,7 @@ require("dotenv").config(); // Loads environment variables from .env file
       page: emptyStrArray,
       ppassport: emptyStrArray,
       passport_expiry_date: nullsArray,
-      passport_no: nullsArray,
+      passport_no: emptyStrArray,
       passport_type: nullsArray,
       visa_expire_date: nullsArray,
       visa_issue_date: nullsArray,
@@ -389,7 +429,9 @@ require("dotenv").config(); // Loads environment variables from .env file
     };
     r = await axiosReq(ENDPOINTS.CONFIRM, confirmPayload, token, "patch");
     if (!r?.data?.data?.redirectUrl)
-      fatal("Could not get payment URL from confirmation response", r.data);
+      throw new Error(
+        `Could not get payment URL. Response: ${JSON.stringify(r.data)}`
+      );
 
     const paymentUrl = r.data.data.redirectUrl;
     log("✅ Booking Confirmed!");
@@ -397,8 +439,70 @@ require("dotenv").config(); // Loads environment variables from .env file
     await open(paymentUrl);
 
     log("\n===== PLEASE COMPLETE YOUR PAYMENT IN THE BROWSER =====");
-    process.exit(0);
   } catch (err) {
-    fatal(err.message || err, err.response ? err.response.data : undefined);
+    log(`\nAn error occurred during the process: ${err.message}`);
+
+    // ensure readline is closed if still open
+    try {
+      if (rl) {
+        rl.close();
+        rl = null;
+      }
+    } catch (e) {
+      log("Failed to close readline:", e.message || e);
+    }
+
+    if (successfullyReserved.length > 0) {
+      log(
+        `Attempting to release ${successfullyReserved.length} reserved seat(s)...`
+      );
+
+      // release each ticket individually and don't let one failure cancel the others
+      const releasePromises = successfullyReserved.map(async (tid) => {
+        try {
+          log(`  - Releasing ticket ID: ${tid}`);
+          if (!ENDPOINTS.RELEASE_SEAT) {
+            log(
+              "    - RELEASE_SEAT endpoint not configured; skipping release."
+            );
+            return;
+          }
+          if (!trip || !trip.trip_route_id) {
+            log(
+              "    - trip or trip_route_id missing; cannot release ticket, skipping."
+            );
+            return;
+          }
+          await axiosReq(
+            ENDPOINTS.RELEASE_SEAT,
+            { ticket_id: tid, route_id: trip.trip_route_id },
+            token,
+            "patch"
+          );
+          log(`    - Released ${tid}`);
+        } catch (releaseErr) {
+          log(
+            `    - Failed to release ${tid}: ${
+              releaseErr.message || releaseErr
+            }`
+          );
+        }
+      });
+
+      await Promise.all(releasePromises);
+      log("Release attempts finished.");
+    }
+
+    // include details if provided on the error
+    const details = err && err.details ? err.details : undefined;
+    // show only server error code + first message (no full details)
+    const shortMsg =
+      details && details.error
+        ? `Booking failed — code ${details.error.code}: ${
+            details.error.messages?.[0] ?? "Unknown error"
+          }`
+        : "Booking process failed and has been rolled back.";
+
+    fatal(shortMsg);
   }
 })();
