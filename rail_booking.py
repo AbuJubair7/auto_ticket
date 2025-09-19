@@ -16,6 +16,7 @@ import sys
 import json
 import re
 import requests
+from requests.adapters import HTTPAdapter
 import concurrent.futures
 import webbrowser
 from typing import Any, Dict, List, Optional
@@ -62,6 +63,15 @@ class HTTPResponse:
         self.status = status
         self.data = data
 
+# Pooled HTTP session (keep-alive) similar to JS keep-alive agents
+_SESSION = requests.Session()
+# Tune pool sizes; can be overridden with env
+_POOL_CONN = int(os.getenv("POOL_CONNECTIONS", "50") or "50")
+_POOL_SIZE = int(os.getenv("POOL_MAXSIZE", "50") or "50")
+_ADAPTER = HTTPAdapter(pool_connections=_POOL_CONN, pool_maxsize=_POOL_SIZE)
+_SESSION.mount("http://", _ADAPTER)
+_SESSION.mount("https://", _ADAPTER)
+
 
 def axios_req(url: str, data: Any = None, token: Optional[str] = None, method: str = "post", config_request_timeout_ms: int = 20000) -> HTTPResponse:
     """
@@ -86,14 +96,14 @@ def axios_req(url: str, data: Any = None, token: Optional[str] = None, method: s
 
     try:
         if method_lower == "get":
-            res = requests.get(url, headers=headers, params=data, timeout=timeout_seconds)
+            res = _SESSION.get(url, headers=headers, params=data, timeout=timeout_seconds)
         elif method_lower == "post":
-            res = requests.post(url, headers=headers, json=data, timeout=timeout_seconds)
+            res = _SESSION.post(url, headers=headers, json=data, timeout=timeout_seconds)
         elif method_lower == "patch":
-            res = requests.patch(url, headers=headers, json=data, timeout=timeout_seconds)
+            res = _SESSION.patch(url, headers=headers, json=data, timeout=timeout_seconds)
         else:
             # fallback: try to send as post
-            res = requests.request(method_lower, url, headers=headers, json=data, timeout=timeout_seconds)
+            res = _SESSION.request(method_lower, url, headers=headers, json=data, timeout=timeout_seconds)
     except requests.exceptions.Timeout as te:
         # mirror JS behavior for timeout -> throw specialized error
         raise Exception(f"Request timeout for {url}")
@@ -254,34 +264,97 @@ def main():
             if not trains:
                 raise Exception(f'The specified train "{CONFIG["TRAIN_NAME"]}" was not found.')
 
-        trip = find_trip_for_seat_class(trains, CONFIG["SEAT_CLASS"], CONFIG["NEED_SEATS"])
-        if not trip:
-            raise Exception(f'No train found with at least {CONFIG["NEED_SEATS"]} available seats of class "{CONFIG["SEAT_CLASS"]}".')
+        # ---- Top-K candidate probing (parallel) ----
+        def _online_seats_for_class(train: Dict[str, Any], seat_class: str) -> int:
+            try:
+                st_list = train.get("seat_types") or []
+                st = next((x for x in st_list if (x.get("type") or "").lower() == seat_class), None)
+                return int(((st or {}).get("seat_counts") or {}).get("online", 0))
+            except Exception:
+                return 0
+
+        sorted_trains = sorted(
+            trains,
+            key=lambda t: _online_seats_for_class(t, CONFIG["SEAT_CLASS"]),
+            reverse=True,
+        )
+        # Fixed K-probe size (not configurable via env)
+        K = 3
+        candidates = sorted_trains[:K]
+
+        def _probe_candidate(train: Dict[str, Any]):
+            # Raise on not enough, and attach server response to e.details
+            st_list = train.get("seat_types") or []
+            st = next((x for x in st_list if (x.get("type") or "").lower() == CONFIG["SEAT_CLASS"]), None)
+            if not st:
+                e = Exception("seat_class not found on candidate")
+                raise e
+            resp = axios_req(ENDPOINTS["SEAT_LAYOUT"], {"trip_id": st.get("trip_id"), "trip_route_id": st.get("trip_route_id")}, token=token, method="get", config_request_timeout_ms=CONFIG["REQUEST_TIMEOUT"])
+            avail = find_available_seats(resp.data if isinstance(resp.data, dict) else {}, CONFIG["NEED_SEATS"], CONFIG["PREFERRED_COACHES"], CONFIG["PREFERRED_SEATS"])
+            if len(avail) >= CONFIG["NEED_SEATS"]:
+                return {
+                    "trip": {
+                        "trip_id": st.get("trip_id"),
+                        "trip_route_id": st.get("trip_route_id"),
+                        "train_label": train.get("trip_number") or train.get("train_model") or None,
+                        "boarding_point_id": ((train.get("boarding_points") or [{}])[0]).get("trip_point_id"),
+                    },
+                    "available_seats": avail,
+                    "raw_seat_layout_response": resp.data,
+                }
+            e = Exception("Not enough matching seats for this candidate")
+            try:
+                e.details = resp.data
+            except Exception:
+                pass
+            raise e
+
+        chosen = None
+        probe_errors: List[Exception] = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(candidates), 4) or 1) as executor:
+            futs = [executor.submit(_probe_candidate, t) for t in candidates]
+            for fut in concurrent.futures.as_completed(futs):
+                try:
+                    res = fut.result()
+                    if res:
+                        chosen = res
+                        break
+                except Exception as pe:
+                    probe_errors.append(pe)
+
+        if not chosen:
+            err = Exception(f'No train found with at least {CONFIG["NEED_SEATS"]} available seats of class "{CONFIG["SEAT_CLASS"]}".')
+            # propagate one error's server details if present
+            for pe in probe_errors:
+                det = getattr(pe, "details", None)
+                if det is not None:
+                    try:
+                        err.details = det
+                    except Exception:
+                        pass
+                    break
+            raise err
+
+        trip = chosen["trip"]
+        available_seats = chosen["available_seats"]
         log("Selected trip:", trip.get("train_label"))
 
-        log("3) Fetching and filtering seat layout...")
-        r = axios_req(ENDPOINTS["SEAT_LAYOUT"], {"trip_id": trip["trip_id"], "trip_route_id": trip["trip_route_id"]}, token=token, method="get", config_request_timeout_ms=CONFIG["REQUEST_TIMEOUT"])
-
-        available_seats = find_available_seats(r.data if isinstance(r.data, dict) else {}, CONFIG["NEED_SEATS"], CONFIG["PREFERRED_COACHES"], CONFIG["PREFERRED_SEATS"])
-
-        # =================================================================
-        # MODIFIED ERROR LOGIC STARTS HERE (kept same as provided JS)
-        # =================================================================
+        # Attach detailed error if somehow seats are still insufficient
         if len(available_seats) < CONFIG["NEED_SEATS"]:
-            err = Exception(f"Could not find enough seats matching preferences. Found {len(available_seats)}, needed {CONFIG['NEED_SEATS']}.")
-            # attach details like in JS
+            err = Exception(
+                f"Could not find enough seats matching preferences. Found {len(available_seats)}, needed {CONFIG['NEED_SEATS']}."
+            )
             try:
-                err.details = r.data
+                err.details = chosen.get("raw_seat_layout_response")
             except Exception:
                 pass
             raise err
-        # =================================================================
-        # MODIFIED ERROR LOGIC ENDS HERE
-        # =================================================================
 
-        seat_numbers = ", ".join([s["seat_number"] for s in available_seats])
+        # Map ticket_id -> seat_number and prep reservation list
+        ticket_id_to_seat_no = {s["ticket_id"]: s["seat_number"] for s in available_seats}
         ticket_ids_to_reserve = [s["ticket_id"] for s in available_seats]
-        log(f'Found {len(available_seats)} seats: {seat_numbers}')
+        seat_numbers_found = ", ".join([s["seat_number"] for s in available_seats])
+        log(f'Found {len(available_seats)} seats: {seat_numbers_found}')
 
         log("4) Reserving seats (in parallel)...")
 
@@ -317,7 +390,6 @@ def main():
 
         successes = [r for r in results if r[0] is True]
         failures = [r for r in results if r[0] is False]
-
         for ok, tid, _ in successes:
             log(f"  - Successfully reserved ticket ID: {tid}")
         for ok, tid, reason in failures:
@@ -327,20 +399,34 @@ def main():
                 reason_str = repr(reason)
             log(f"  - Failed to reserve ticket ID: {tid}. Reason: {reason_str}")
 
-        # Add successful reservations to rollback list
-        for ok, tid, _ in successes:
-            successfully_reserved.append(tid)
-
-        if failures:
+        # Stop-when-enough: require at least NEED_SEATS successes
+        if len(successes) < CONFIG["NEED_SEATS"]:
             sample = []
             for _, tid, reason in failures[:3]:
                 try:
                     sample.append({"tid": tid, "reason": reason if isinstance(reason, str) else json.dumps(reason)})
                 except Exception:
                     sample.append({"tid": tid, "reason": repr(reason)})
-            raise Exception(f"Failed to reserve {len(failures)}/{len(ticket_ids_to_reserve)} seat(s). Sample: {json.dumps(sample, ensure_ascii=False)}")
+            err = Exception(
+                f"Only reserved {len(successes)}/{CONFIG['NEED_SEATS']} seat(s). Sample failures: {json.dumps(sample, ensure_ascii=False)}"
+            )
+            # Attach reservation attempt details (including server responses) for debugging
+            try:
+                err.details = {
+                    "failures": [{"tid": tid, "reason": reason} for _, tid, reason in failures],
+                    "reserveResults": [
+                        {"ok": ok, "tid": tid, "reason": reason} for (ok, tid, reason) in results
+                    ],
+                }
+            except Exception:
+                pass
+            raise err
 
-        log(f"Successfully reserved all {len(successfully_reserved)} seats.")
+        # Use only the first NEED_SEATS successes
+        reserved_tids = [tid for _, tid, _ in successes][: CONFIG["NEED_SEATS"]]
+        successfully_reserved[:] = reserved_tids
+        reserved_seat_numbers = ", ".join([ticket_id_to_seat_no.get(tid, "?") for tid in reserved_tids])
+        log(f"Successfully reserved {len(successes)} seat(s). Proceeding with: {reserved_seat_numbers}")
         # Ask user whether to proceed after successful reservations
         proceed_answer = ask_question("Do you want to proceed to OTP verification? (yes/no): ")
         if (proceed_answer or "").strip().lower() not in ("y", "yes"):
@@ -407,8 +493,8 @@ def main():
         log(f"To:             {CONFIG['TO_CITY']}")
         log(f"Date:           {CONFIG['DATE_OF_JOURNEY']}")
         log(f"Class:          {CONFIG['SEAT_CLASS']}")
-        log(f"Total Seats:    {len(available_seats)}")
-        log(f"Seat Numbers:   {seat_numbers}")
+        log(f"Total Seats:    {min(len(successes), CONFIG['NEED_SEATS'])}")
+        log(f"Seat Numbers:   {reserved_seat_numbers}")
         log("\nPassengers:")
         for i in range(len(passenger_details["pname"])):
             log(f"  - {passenger_details['pname'][i]} ({passenger_details['passengerType'][i]}, {passenger_details['gender'][i]})")
@@ -512,7 +598,12 @@ def main():
             if isinstance(messages, list) and messages:
                 msg0 = messages[0]
             short_msg = f"Booking failed — code {code}: {msg0 or 'Unknown error'}"
-        fatal(short_msg)
+        # DEBUG_ERRORS env toggle to include full details payload
+        DEBUG_ERRORS = (os.getenv("DEBUG_ERRORS", "") or "").strip().lower()
+        if DEBUG_ERRORS in ("1", "true", "yes") and details is not None:
+            fatal(short_msg, details)
+        else:
+            fatal(short_msg)
 
 
 if __name__ == "__main__":

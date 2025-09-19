@@ -4,6 +4,8 @@
  */
 
 const axios = require("axios");
+const http = require("http");
+const https = require("https");
 const readline = require("readline");
 require("dotenv").config();
 
@@ -45,6 +47,14 @@ require("dotenv").config();
     CONFIRM: `${CONFIG.BASE}/bookings/confirm`,
   };
 
+  // Keep-Alive axios instance to reuse TCP/TLS connections
+  const axiosInstance = axios.create({
+    httpAgent: new http.Agent({ keepAlive: true, maxSockets: 50 }),
+    httpsAgent: new https.Agent({ keepAlive: true, maxSockets: 50 }),
+    timeout: CONFIG.REQUEST_TIMEOUT,
+    validateStatus: null,
+  });
+
   function log(...args) {
     console.log("[rail]", ...args);
   }
@@ -79,12 +89,10 @@ require("dotenv").config();
         url,
         method: method.toLowerCase(),
         headers,
-        timeout: CONFIG.REQUEST_TIMEOUT,
-        validateStatus: null,
       };
       if (method.toLowerCase() === "get") opts.params = data;
       else opts.data = data;
-      const res = await axios(opts);
+      const res = await axiosInstance.request(opts);
       return res;
     } catch (e) {
       if (e.code === "ECONNABORTED")
@@ -192,6 +200,7 @@ require("dotenv").config();
     log("Signed in.");
 
     rl = createReadline();
+    let cmd;
     cmd = await askQuestion(
       rl,
       "Do you want to proceed with the booking? (yes/no): "
@@ -224,26 +233,75 @@ require("dotenv").config();
           `The specified train "${CONFIG.TRAIN_NAME}" was not found.`
         );
     }
-    trip = findTripForSeatClass(trains, CONFIG.SEAT_CLASS, CONFIG.NEED_SEATS);
-    if (!trip)
-      throw new Error(
+    // Probe top-K candidate trains in parallel to find the first with enough matching seats
+    const seatClass = CONFIG.SEAT_CLASS;
+    function getOnlineSeatsForClass(train) {
+      const st = (train.seat_types || []).find(
+        (x) => (x.type || "").toLowerCase() === seatClass
+      );
+      return (st && st.seat_counts && st.seat_counts.online) || 0;
+    }
+    const sorted = [...trains].sort(
+      (a, b) => getOnlineSeatsForClass(b) - getOnlineSeatsForClass(a)
+    );
+    const K = 3; // probe top K candidates
+    const candidates = sorted.slice(0, K);
+
+    async function probeCandidate(train) {
+      const st = (train.seat_types || []).find(
+        (x) => (x.type || "").toLowerCase() === seatClass
+      );
+      if (!st) throw new Error("seat_class not found on candidate");
+      const resp = await axiosReq(
+        ENDPOINTS.SEAT_LAYOUT,
+        { trip_id: st.trip_id, trip_route_id: st.trip_route_id },
+        token,
+        "get"
+      );
+      const avail = findAvailableSeats(
+        resp.data,
+        CONFIG.NEED_SEATS,
+        CONFIG.PREFERRED_COACHES,
+        CONFIG.PREFERRED_SEATS
+      );
+      if (avail.length >= CONFIG.NEED_SEATS) {
+        return {
+          trip: {
+            trip_id: st.trip_id,
+            trip_route_id: st.trip_route_id,
+            train_label: train.trip_number || train.train_model || null,
+            boarding_point_id: train.boarding_points?.[0]?.trip_point_id,
+          },
+          availableSeats: avail,
+          rawSeatLayoutResponse: resp.data,
+        };
+      }
+      const err = new Error("Not enough matching seats for this candidate");
+      // Attach server response so callers can surface error code/message
+      err.details = resp.data;
+      throw err;
+    }
+
+    let chosen;
+    try {
+      chosen = await Promise.any(candidates.map(probeCandidate));
+    } catch (e) {
+      // AggregateError from Promise.any — try to propagate one server response's details
+      const errs = e && e.errors && Array.isArray(e.errors) ? e.errors : [];
+      const withDetails =
+        errs.find((x) => x && x.details && x.details.error) ||
+        errs.find((x) => x && x.details);
+      const error = new Error(
         `No train found with at least ${CONFIG.NEED_SEATS} available seats of class "${CONFIG.SEAT_CLASS}".`
       );
-    log("Selected trip:", trip.train_label);
+      if (withDetails && withDetails.details)
+        error.details = withDetails.details;
+      throw error;
+    }
 
-    log("3) Fetching and filtering seat layout...");
-    r = await axiosReq(
-      ENDPOINTS.SEAT_LAYOUT,
-      { trip_id: trip.trip_id, trip_route_id: trip.trip_route_id },
-      token,
-      "get"
-    );
-    const availableSeats = findAvailableSeats(
-      r.data,
-      CONFIG.NEED_SEATS,
-      CONFIG.PREFERRED_COACHES,
-      CONFIG.PREFERRED_SEATS
-    );
+    const { trip: chosenTrip, availableSeats } = chosen;
+    trip = chosenTrip;
+    log("Selected trip:", trip.train_label);
 
     // =================================================================
     // MODIFIED ERROR LOGIC STARTS HERE
@@ -253,16 +311,21 @@ require("dotenv").config();
         `Could not find enough seats matching preferences. Found ${availableSeats.length}, needed ${CONFIG.NEED_SEATS}.`
       );
       // Attach the full server response to the error for better debugging
-      error.details = r.data;
+      error.details = chosen.rawSeatLayoutResponse || null;
       throw error;
     }
     // =================================================================
     // MODIFIED ERROR LOGIC ENDS HERE
     // =================================================================
 
-    const seatNumbers = availableSeats.map((s) => s.seat_number).join(", ");
+    const ticketIdToSeatNo = Object.fromEntries(
+      availableSeats.map((s) => [s.ticket_id, s.seat_number])
+    );
     const ticketIdsToReserve = availableSeats.map((s) => s.ticket_id);
-    log(`Found ${availableSeats.length} seats: ${seatNumbers}`);
+    const seatNumbersFound = availableSeats
+      .map((s) => s.seat_number)
+      .join(", ");
+    log(`Found ${availableSeats.length} seats: ${seatNumbersFound}`);
 
     log("4) Reserving seats (in parallel)...");
     const reserveResults = await Promise.all(
@@ -288,6 +351,9 @@ require("dotenv").config();
     const successes = reserveResults.filter((x) => x.ok);
     const failures = reserveResults.filter((x) => !x.ok);
 
+    // add successful reservations to rollback list
+    successfullyReserved.push(...successes.map((s) => s.tid));
+
     for (const s of successes) {
       log(`  - Successfully reserved ticket ID: ${s.tid}`);
     }
@@ -299,20 +365,30 @@ require("dotenv").config();
       );
     }
 
-    // add successful reservations to rollback list
-    successfullyReserved.push(...successes.map((s) => s.tid));
-
-    if (failures.length > 0) {
+    if (successes.length < CONFIG.NEED_SEATS) {
       const summary = failures
         .map((f) => ({ tid: f.tid, reason: f.reason }))
-        .slice(0, 3); // cap preview
-      throw new Error(
-        `Failed to reserve ${failures.length}/${
-          ticketIdsToReserve.length
-        } seat(s). Sample: ${JSON.stringify(summary)}`
+        .slice(0, 3);
+      const err = new Error(
+        `Only reserved ${successes.length}/${
+          CONFIG.NEED_SEATS
+        } seat(s). Sample failures: ${JSON.stringify(summary)}`
       );
+      // Attach reservation attempt details (including server responses) for debugging
+      err.details = {
+        failures: failures.map((f) => ({ tid: f.tid, reason: f.reason })),
+        reserveResults,
+      };
+      throw err;
     }
-    log(`Successfully reserved all ${successfullyReserved.length} seats.`);
+
+    const reservedSeatNumbers = successes
+      .slice(0, CONFIG.NEED_SEATS)
+      .map((s) => ticketIdToSeatNo[s.tid])
+      .join(", ");
+    log(
+      `Successfully reserved ${successes.length} seat(s). Proceeding with: ${reservedSeatNumbers}`
+    );
 
     cmd = await askQuestion(
       rl,
@@ -416,8 +492,8 @@ require("dotenv").config();
     log(`To:             ${CONFIG.TO_CITY}`);
     log(`Date:           ${CONFIG.DATE_OF_JOURNEY}`);
     log(`Class:          ${CONFIG.SEAT_CLASS}`);
-    log(`Total Seats:    ${availableSeats.length}`);
-    log(`Seat Numbers:   ${seatNumbers}`);
+    log(`Total Seats:    ${Math.min(successes.length, CONFIG.NEED_SEATS)}`);
+    log(`Seat Numbers:   ${reservedSeatNumbers}`);
     log("\nPassengers:");
     for (let i = 0; i < passengerDetails.pname.length; i++) {
       log(
@@ -556,6 +632,14 @@ require("dotenv").config();
           }`
         : "Booking process failed and has been rolled back.";
 
-    fatal(shortMsg);
+    // If DEBUG_ERRORS is enabled, include full server details in fatal
+    const DEBUG_ERRORS = String(process.env.DEBUG_ERRORS || "").toLowerCase();
+    const debugEnabled =
+      DEBUG_ERRORS === "1" || DEBUG_ERRORS === "true" || DEBUG_ERRORS === "yes";
+    if (debugEnabled && details) {
+      fatal(shortMsg, details);
+    } else {
+      fatal(shortMsg);
+    }
   }
 })();
