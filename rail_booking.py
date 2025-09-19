@@ -347,8 +347,19 @@ def main():
                 ptype = ask_question(rl, f"  - Passenger {i+1} Type (Adult/Child): ")
                 gender = ask_question(rl, f"  - Passenger {i+1} Gender (Male/Female): ")
                 passenger_details["pname"].append(name)
-                passenger_details["passengerType"].append(ptype)
-                passenger_details["gender"].append((gender or "").lower())
+                # Normalize passenger type: accept adult/child/adlt; default to 'adult'
+                ptype_l = (ptype or "").strip().lower()
+                if ptype_l not in ("adult", "child", "adlt"):
+                    passenger_details["passengerType"].append("adult")
+                else:
+                    passenger_details["passengerType"].append(ptype_l)
+
+                # Normalize gender: accept male/female; default to 'male'
+                gender_l = (gender or "").strip().lower()
+                if gender_l not in ("male", "female"):
+                    passenger_details["gender"].append("male")
+                else:
+                    passenger_details["gender"].append(gender_l)
 
         log("\n===== PLEASE REVIEW YOUR BOOKING DETAILS =====")
         log(f"Train:          {trip.get('train_label')}")

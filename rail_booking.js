@@ -363,8 +363,16 @@ require("dotenv").config();
           `  - Passenger ${i + 1} Gender (Male/Female): `
         );
         passengerDetails.pname.push(name);
-        passengerDetails.passengerType.push(type);
-        passengerDetails.gender.push(gender.toLowerCase());
+        if (
+          type.toLowerCase() != "adult" &&
+          type.toLowerCase() != "child" &&
+          type.toLowerCase() != "adlt"
+        )
+          passengerDetails.passengerType.push("adult");
+        else passengerDetails.passengerType.push(type.toLowerCase());
+        if (gender.toLowerCase() != "male" && gender.toLowerCase() != "female")
+          passengerDetails.gender.push("male");
+        else passengerDetails.gender.push(gender.toLowerCase());
       }
     }
 
