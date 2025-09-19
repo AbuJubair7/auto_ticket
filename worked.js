@@ -191,6 +191,17 @@ require("dotenv").config();
     if (!token) throw new Error("Sign-in failed (no token received)");
     log("Signed in.");
 
+    rl = createReadline();
+    let cmd = await askQuestion(
+      rl,
+      "Do you want to proceed with the booking? (yes/no): "
+    );
+    if (cmd.toLowerCase() !== "yes" && cmd.toLowerCase() !== "y") {
+      throw new Error("Booking process aborted by user.");
+    }
+    rl.close();
+    rl = null; // mark closed
+
     log(`2) Searching trips ${CONFIG.FROM_CITY} -> ${CONFIG.TO_CITY}...`);
     r = await axiosReq(
       ENDPOINTS.SEARCH,

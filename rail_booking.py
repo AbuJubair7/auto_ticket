@@ -200,7 +200,6 @@ CONFIG = {
     "TRAIN_NAME": (os.getenv("TRAIN_NAME", "") or "").lower(),
     "PREFERRED_COACHES": [c.strip().lower() for c in os.getenv("PREFERRED_COACHES", "").split(",")] if os.getenv("PREFERRED_COACHES", "") else [],
     "PREFERRED_SEATS": [s.strip() for s in os.getenv("PREFERRED_SEATS", "").split(",")] if os.getenv("PREFERRED_SEATS", "") else [],
-    # JS had REQUEST_TIMEOUT = 20000 (ms). Keep same default and pass ms to axios_req which converts to seconds.
     "REQUEST_TIMEOUT": int(os.getenv("REQUEST_TIMEOUT", "20000")),
     "DEVICE_ID": os.getenv("DEVICE_ID", "4004028937") or "4004028937",
     "REFERER": os.getenv("REFERER", "https://eticket.railway.gov.bd/") or "https://eticket.railway.gov.bd/",
@@ -238,7 +237,11 @@ def main():
         if not token:
             raise Exception("Sign-in failed (no token received)")
         log("Signed in.")
-
+        # Ask user whether to proceed after successful sign-in
+        proceed_answer = ask_question(None, "Do you want to proceed with the booking? (yes/no): ")
+        if (proceed_answer or "").strip().lower() not in ("y", "yes"):
+            raise Exception("Booking process aborted by user.")
+        
         log(f'2) Searching trips {CONFIG["FROM_CITY"]} -> {CONFIG["TO_CITY"]}...')
         r = axios_req(ENDPOINTS["SEARCH"], {
             "from_city": CONFIG["FROM_CITY"],
