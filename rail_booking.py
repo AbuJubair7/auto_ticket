@@ -16,6 +16,7 @@ import sys
 import json
 import re
 import requests
+import concurrent.futures
 import webbrowser
 from typing import Any, Dict, List, Optional
 
@@ -45,16 +46,8 @@ def fatal(err: Any, data: Any = None):
     sys.exit(1)
 
 
-def create_readline():
-    """
-    JS used readline interface so we keep a flagable object.
-    In Python we will simply use input() via ask_question, but keep `rl` variable for parity.
-    """
-    return True  # marker that 'readline' is available
-
-
-def ask_question(rl, query: str) -> str:
-    # rl is a marker; using built-in input() for simplicity
+def ask_question(query: str) -> str:
+    # using built-in input() for simplicity
     try:
         return input(query).strip()
     except EOFError:
@@ -223,7 +216,7 @@ def main():
     token = None
     trip = None
     successfully_reserved: List[str] = []
-    rl = None
+    rl = None  # removed usage; kept name to minimize diff in error handling
     otp_payload = None  # accessible after OTP verification
 
     try:
@@ -238,7 +231,7 @@ def main():
             raise Exception("Sign-in failed (no token received)")
         log("Signed in.")
         # Ask user whether to proceed after successful sign-in
-        proceed_answer = ask_question(None, "Do you want to proceed with the booking? (yes/no): ")
+        proceed_answer = ask_question("Do you want to proceed with the booking? (yes/no): ")
         if (proceed_answer or "").strip().lower() not in ("y", "yes"):
             raise Exception("Booking process aborted by user.")
         
@@ -290,21 +283,68 @@ def main():
         ticket_ids_to_reserve = [s["ticket_id"] for s in available_seats]
         log(f'Found {len(available_seats)} seats: {seat_numbers}')
 
-        log("4) Reserving seats...")
-        for tid in ticket_ids_to_reserve:
-            r = axios_req(ENDPOINTS["RESERVE"], {"ticket_id": tid, "route_id": trip["trip_route_id"]}, token=token, method="patch", config_request_timeout_ms=CONFIG["REQUEST_TIMEOUT"])
-            # JS checks status >= 300 OR r.data?.data?.error
-            status_bad = getattr(r, "status", 0) >= 300
-            data_has_error = False
-            if isinstance(r.data, dict):
-                data_has_error = bool((r.data.get("data") or {}).get("error"))
-            if status_bad or data_has_error:
-                raise Exception(f"Failed to reserve ticket ID {tid}. Reason: {json.dumps(r.data)}")
-            log(f"  - Successfully reserved ticket ID: {tid}")
-            successfully_reserved.append(tid)
-        log(f"Successfully reserved all {len(successfully_reserved)} seats.")
+        log("4) Reserving seats (in parallel)...")
 
-        rl = create_readline()  # marker used for parity with JS
+        def _reserve_one(tid: str):
+            try:
+                rr = axios_req(
+                    ENDPOINTS["RESERVE"],
+                    {"ticket_id": tid, "route_id": trip["trip_route_id"]},
+                    token=token,
+                    method="patch",
+                    config_request_timeout_ms=CONFIG["REQUEST_TIMEOUT"],
+                )
+                status_bad = getattr(rr, "status", 0) >= 300
+                data_has_error = False
+                if isinstance(rr.data, dict):
+                    data_has_error = bool((rr.data.get("data") or {}).get("error"))
+                if status_bad or data_has_error:
+                    return (False, tid, rr.data)
+                return (True, tid, None)
+            except Exception as e:
+                return (False, tid, str(e))
+
+        results = []
+        max_workers = max(2, min(len(ticket_ids_to_reserve), 8))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(_reserve_one, tid) for tid in ticket_ids_to_reserve]
+            for fut in concurrent.futures.as_completed(futures):
+                try:
+                    results.append(fut.result())
+                except Exception as e:
+                    # Shouldn't happen since _reserve_one catches, but guard anyway
+                    results.append((False, "unknown", str(e)))
+
+        successes = [r for r in results if r[0] is True]
+        failures = [r for r in results if r[0] is False]
+
+        for ok, tid, _ in successes:
+            log(f"  - Successfully reserved ticket ID: {tid}")
+        for ok, tid, reason in failures:
+            try:
+                reason_str = reason if isinstance(reason, str) else json.dumps(reason)
+            except Exception:
+                reason_str = repr(reason)
+            log(f"  - Failed to reserve ticket ID: {tid}. Reason: {reason_str}")
+
+        # Add successful reservations to rollback list
+        for ok, tid, _ in successes:
+            successfully_reserved.append(tid)
+
+        if failures:
+            sample = []
+            for _, tid, reason in failures[:3]:
+                try:
+                    sample.append({"tid": tid, "reason": reason if isinstance(reason, str) else json.dumps(reason)})
+                except Exception:
+                    sample.append({"tid": tid, "reason": repr(reason)})
+            raise Exception(f"Failed to reserve {len(failures)}/{len(ticket_ids_to_reserve)} seat(s). Sample: {json.dumps(sample, ensure_ascii=False)}")
+
+        log(f"Successfully reserved all {len(successfully_reserved)} seats.")
+        # Ask user whether to proceed after successful reservations
+        proceed_answer = ask_question("Do you want to proceed to OTP verification? (yes/no): ")
+        if (proceed_answer or "").strip().lower() not in ("y", "yes"):
+            raise Exception("Booking process aborted by user.")
         log("5) Triggering OTP send...")
         passenger_payload = {"trip_id": trip["trip_id"], "trip_route_id": trip["trip_route_id"], "ticket_ids": successfully_reserved}
         r = axios_req(ENDPOINTS["PASSENGER_DETAILS"], passenger_payload, token=token, method="post", config_request_timeout_ms=CONFIG["REQUEST_TIMEOUT"])
@@ -318,7 +358,7 @@ def main():
         last_otp_error = None
 
         for attempt in range(1, 4):
-            otp = ask_question(rl, f"Please enter the OTP you received (Attempt {attempt}/3): ")
+            otp = ask_question(f"Please enter the OTP you received (Attempt {attempt}/3): ")
             if not otp or not re.match(r"^\d{4,6}$", otp):
                 log("Invalid OTP format. Please try again.")
                 continue
@@ -343,9 +383,9 @@ def main():
         if CONFIG["NEED_SEATS"] > 1:
             log(f'Please enter details for the other {CONFIG["NEED_SEATS"] - 1} passenger(s).')
             for i in range(1, CONFIG["NEED_SEATS"]):
-                name = ask_question(rl, f"  - Passenger {i+1} Name: ")
-                ptype = ask_question(rl, f"  - Passenger {i+1} Type (Adult/Child): ")
-                gender = ask_question(rl, f"  - Passenger {i+1} Gender (Male/Female): ")
+                name = ask_question(f"  - Passenger {i+1} Name: ")
+                ptype = ask_question(f"  - Passenger {i+1} Type (Adult/Child): ")
+                gender = ask_question(f"  - Passenger {i+1} Gender (Male/Female): ")
                 passenger_details["pname"].append(name)
                 # Normalize passenger type: accept adult/child/adlt; default to 'adult'
                 ptype_l = (ptype or "").strip().lower()
@@ -374,9 +414,7 @@ def main():
             log(f"  - {passenger_details['pname'][i]} ({passenger_details['passengerType'][i]}, {passenger_details['gender'][i]})")
         log("============================================")
 
-        confirmation = ask_question(rl, "Proceed to payment? (yes/no): ")
-        # close 'rl' marker
-        rl = None
+        confirmation = ask_question("Proceed to payment? (yes/no): ")
         if confirmation.lower() not in ("yes", "y"):
             raise Exception("Booking cancelled by user.")
 
@@ -442,13 +480,7 @@ def main():
         err_msg = str(err)
         log(f"\nAn error occurred during the process: {err_msg}")
 
-        # ensure readline is closed if still open (rl marker)
-        try:
-            if rl:
-                # nothing real to close, but keep parity
-                rl = None
-        except Exception as e:
-            log("Failed to close readline:", getattr(e, "message", e))
+        # rl no longer used; nothing to close
 
         if successfully_reserved:
             log(f"Attempting to release {len(successfully_reserved)} reserved seat(s)...")
