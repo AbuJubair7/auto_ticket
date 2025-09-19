@@ -192,15 +192,13 @@ require("dotenv").config();
     log("Signed in.");
 
     rl = createReadline();
-    let cmd = await askQuestion(
+    cmd = await askQuestion(
       rl,
       "Do you want to proceed with the booking? (yes/no): "
     );
     if (cmd.toLowerCase() !== "yes" && cmd.toLowerCase() !== "y") {
       throw new Error("Booking process aborted by user.");
     }
-    rl.close();
-    rl = null; // mark closed
 
     log(`2) Searching trips ${CONFIG.FROM_CITY} -> ${CONFIG.TO_CITY}...`);
     r = await axiosReq(
@@ -266,27 +264,63 @@ require("dotenv").config();
     const ticketIdsToReserve = availableSeats.map((s) => s.ticket_id);
     log(`Found ${availableSeats.length} seats: ${seatNumbers}`);
 
-    log("4) Reserving seats...");
-    for (const tid of ticketIdsToReserve) {
-      r = await axiosReq(
-        ENDPOINTS.RESERVE,
-        { ticket_id: tid, route_id: trip.trip_route_id },
-        token,
-        "patch"
+    log("4) Reserving seats (in parallel)...");
+    const reserveResults = await Promise.all(
+      ticketIdsToReserve.map(async (tid) => {
+        try {
+          const rr = await axiosReq(
+            ENDPOINTS.RESERVE,
+            { ticket_id: tid, route_id: trip.trip_route_id },
+            token,
+            "patch"
+          );
+          const failed = rr.status >= 300 || rr?.data?.data?.error;
+          if (failed) {
+            return { tid, ok: false, reason: rr?.data };
+          }
+          return { tid, ok: true };
+        } catch (e) {
+          return { tid, ok: false, reason: e?.message || String(e) };
+        }
+      })
+    );
+
+    const successes = reserveResults.filter((x) => x.ok);
+    const failures = reserveResults.filter((x) => !x.ok);
+
+    for (const s of successes) {
+      log(`  - Successfully reserved ticket ID: ${s.tid}`);
+    }
+    for (const f of failures) {
+      log(
+        `  - Failed to reserve ticket ID: ${f.tid}. Reason: ${
+          typeof f.reason === "string" ? f.reason : JSON.stringify(f.reason)
+        }`
       );
-      if (r.status >= 300 || r.data?.data?.error) {
-        throw new Error(
-          `Failed to reserve ticket ID ${tid}. Reason: ${JSON.stringify(
-            r.data
-          )}`
-        );
-      }
-      log(`  - Successfully reserved ticket ID: ${tid}`);
-      successfullyReserved.push(tid);
+    }
+
+    // add successful reservations to rollback list
+    successfullyReserved.push(...successes.map((s) => s.tid));
+
+    if (failures.length > 0) {
+      const summary = failures
+        .map((f) => ({ tid: f.tid, reason: f.reason }))
+        .slice(0, 3); // cap preview
+      throw new Error(
+        `Failed to reserve ${failures.length}/${
+          ticketIdsToReserve.length
+        } seat(s). Sample: ${JSON.stringify(summary)}`
+      );
     }
     log(`Successfully reserved all ${successfullyReserved.length} seats.`);
 
-    rl = createReadline();
+    cmd = await askQuestion(
+      rl,
+      "Do you want to proceed to OTP verification? (yes/no): "
+    );
+    if (cmd.toLowerCase() !== "yes" && cmd.toLowerCase() !== "y") {
+      throw new Error("Booking process aborted by user.");
+    }
     log("5) Triggering OTP send...");
     const passengerPayload = {
       trip_id: trip.trip_id,
