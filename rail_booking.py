@@ -159,7 +159,8 @@ def find_available_seats(seat_layout_response: Dict, needed: int, preferred_coac
                     return available
                 if seat.get("seat_availability") == 1 and seat.get("seat_number"):
                     if preferred_seat_numbers:
-                        seat_num_part = seat.get("seat_number", "").split("-")[-1]
+                        parts = seat.get("seat_number", "").split("-")
+                        seat_num_part = parts[1] if len(parts) > 1 else None  # mirror JS: split("-")[1]
                         if seat_num_part in preferred_seat_numbers:
                             available.append({"ticket_id": seat.get("ticket_id"), "seat_number": seat.get("seat_number")})
                     else:
@@ -514,12 +515,22 @@ def main():
     except Exception as err:
         log("\nAn error occurred during the process:", str(err))
 
-        # If we reserved seats, attempt parallel release (rollback) like JS Promise.all
+        # If we reserved seats, attempt release (rollback) mirroring JS safety checks and messages
         if successfully_reserved:
             log(f"Attempting to release {len(successfully_reserved)} reserved seat(s)...")
             with ThreadPoolExecutor(max_workers=len(successfully_reserved) or 1) as ex:
-                futures = [ex.submit(_release_one, tid, trip, token) for tid in successfully_reserved]
-                for fut in as_completed(futures):
+                futures = []
+                for tid in successfully_reserved:
+                    log(f"  - Releasing ticket ID: {tid}")
+                    if not ENDPOINTS.get("RELEASE_SEAT"):
+                        log("    - RELEASE_SEAT endpoint not configured; skipping release.")
+                        continue
+                    if not trip or not (trip.get("trip_route_id")):
+                        log("    - trip or trip_route_id missing; cannot release ticket, skipping.")
+                        continue
+                    futures.append((ex.submit(_release_one, tid, trip, token), tid))
+
+                for fut, tid in futures:
                     try:
                         res = fut.result()
                         if res.get("ok"):
@@ -527,7 +538,7 @@ def main():
                         else:
                             log(f"    - Failed to release {res.get('tid')}: {res.get('reason')}")
                     except Exception as release_err:
-                        log(f"    - Failed to release: {str(release_err)}")
+                        log(f"    - Failed to release {tid}: {str(release_err)}")
             log("Release attempts finished.")
 
         details = getattr(err, "details", None)
