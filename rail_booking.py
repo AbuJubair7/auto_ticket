@@ -1,30 +1,34 @@
 #!/usr/bin/env python3
 """
-rail_booking.py
-Final version: Improved error handling, robust rollback, OTP scope fixes, and cleanup.
-Mirrored from rail_booking.js to Python. No extras.
+rail_booking_ported_and_adjusted.py
+Ported from rail_booking.js with adjustments to make Python behavior match the JS points 1-7:
+ 1) Keep-alive / connection pooling aligned with axios agents (pool sizes + keep-alive header, no automatic retries)
+ 2) Timeouts (20s) preserved
+ 3) Status-code handling: do not raise on non-2xx responses (behave like axios validateStatus: null)
+ 4) Candidate probing mirrors Promise.any semantics as closely as possible (stop when first success; signal other workers)
+ 5) Release (rollback) is performed in parallel, like the JS Promise.all
+ 6) Preserve server error details on exceptions (attach `.details` to exceptions)
+ 7) Browser opening preserved via webbrowser
+No extras beyond these changes.
 """
 
 import os
 import re
 import sys
 import json
-import time
 import webbrowser
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
 from typing import Any, Dict, List, Optional
 
 try:
     from dotenv import load_dotenv
-
     load_dotenv()
 except Exception:
-    # dotenv optional; proceed if not available
     pass
 
 import requests
 from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 
 # --- Configuration ---
 CONFIG = {
@@ -46,7 +50,7 @@ CONFIG = {
         if os.environ.get("PREFERRED_SEATS")
         else []
     ),
-    "REQUEST_TIMEOUT": 20,  # seconds
+    "REQUEST_TIMEOUT": 20,  # seconds (equivalent to JS 20000 ms)
     "DEVICE_ID": "4004028937",
     "REFERER": "https://eticket.railway.gov.bd/",
     "BASE": "https://railspaapi.shohoz.com/v1.0/web",
@@ -63,22 +67,24 @@ ENDPOINTS = {
     "CONFIRM": f"{CONFIG['BASE']}/bookings/confirm",
 }
 
-
-# Keep-alive requests session
+# Keep-alive requests session tuned to match axios agent behavior
 session = requests.Session()
-retries = Retry(total=1, backoff_factor=0.1, status_forcelist=[502, 503, 504])
-adapter = HTTPAdapter(pool_connections=50, pool_maxsize=50, max_retries=retries)
+# No automatic retries to mimic axios default validateStatus: null and no retry behavior
+adapter = HTTPAdapter(pool_connections=50, pool_maxsize=50, max_retries=0)
 session.mount("http://", adapter)
 session.mount("https://", adapter)
-session.headers.update(
-    {
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-        "X-Requested-With": "XMLHttpRequest",
-        "X-Device-Id": CONFIG["DEVICE_ID"],
-        "Referer": CONFIG["REFERER"],
-    }
-)
+# Explicitly set connection keep-alive header
+session.headers.update({
+    "Accept": "application/json",
+    "Content-Type": "application/json",
+    "X-Requested-With": "XMLHttpRequest",
+    "X-Device-Id": CONFIG["DEVICE_ID"],
+    "Referer": CONFIG["REFERER"],
+    "Connection": "keep-alive",
+})
+
+# A global event to signal that a successful candidate was found --- helps approximate Promise.any cancellation
+found_candidate_event = threading.Event()
 
 
 def log(*args):
@@ -117,7 +123,7 @@ def axios_req(url: str, data: Optional[Dict] = None, token: Optional[str] = None
             r = session.post(url, json=data, headers=headers, timeout=timeout)
         else:
             r = session.request(method, url, json=data, headers=headers, timeout=timeout)
-        # do not raise for status to mimic axios validateStatus: null
+        # Do not raise_for_status(): mirror axios validateStatus: null
         return r
     except requests.exceptions.Timeout:
         raise Exception(f"Request timeout for {url}")
@@ -161,46 +167,45 @@ def find_available_seats(seat_layout_response: Dict, needed: int, preferred_coac
     return available
 
 
-def find_trip_for_seat_class(trains: List[Dict], seat_class: str, needed_seats: int):
-    if not trains:
-        return None
-    for t in trains:
-        if not isinstance(t.get("seat_types"), list):
-            continue
-        for st in t.get("seat_types", []):
-            if (st.get("type") or "").lower() == seat_class:
-                if (st.get("seat_counts", {}).get("online") or 0) >= needed_seats:
-                    log(f'Found train "{t.get("trip_number")}" with {st.get("seat_counts", {}).get("online")} available seats.')
-                    return {
-                        "trip_id": st.get("trip_id"),
-                        "trip_route_id": st.get("trip_route_id"),
-                        "train_label": t.get("trip_number") or t.get("train_model"),
-                        "boarding_point_id": (t.get("boarding_points") or [{}])[0].get("trip_point_id"),
-                    }
-                else:
-                    log(f'Skipping train "{t.get("trip_number")}": not enough seats (found {st.get("seat_counts", {}).get("online")}, need {needed_seats}).')
-    return None
-
-
 def get_online_seats_for_class(train: Dict, seat_class: str) -> int:
-    for x in train.get("seat_types", []):
+    for x in train.get("seat_types", []) or []:
         if (x.get("type") or "").lower() == seat_class:
             return (x.get("seat_counts") or {}).get("online", 0)
     return 0
 
 
 def probe_candidate(train: Dict, seat_class: str, token: str):
+    """
+    Probe a single train candidate. Checks `found_candidate_event` before performing heavy work so
+    other workers can exit early if a candidate was already found.
+    """
+    # If another worker already found a candidate, exit early
+    if found_candidate_event.is_set():
+        raise Exception("Cancelled: candidate already found")
+
     st = next((x for x in (train.get("seat_types") or []) if (x.get("type") or "").lower() == seat_class), None)
     if not st:
         err = Exception("seat_class not found on candidate")
         raise err
+
+    # Check again right before network call to try to reduce wasted work
+    if found_candidate_event.is_set():
+        raise Exception("Cancelled: candidate already found")
+
     resp = axios_req(ENDPOINTS["SEAT_LAYOUT"], {"trip_id": st.get("trip_id"), "trip_route_id": st.get("trip_route_id")}, token, "get")
     try:
         data = resp.json()
     except Exception:
         data = {}
+
+    # Allow early exit if someone else finished while we were waiting for network
+    if found_candidate_event.is_set():
+        raise Exception("Cancelled: candidate already found")
+
     avail = find_available_seats(data, CONFIG["NEED_SEATS"], CONFIG["PREFERRED_COACHES"], CONFIG["PREFERRED_SEATS"])
     if len(avail) >= CONFIG["NEED_SEATS"]:
+        # Signal other workers to stop further work
+        found_candidate_event.set()
         return {
             "trip": {
                 "trip_id": st.get("trip_id"),
@@ -211,16 +216,40 @@ def probe_candidate(train: Dict, seat_class: str, token: str):
             "availableSeats": avail,
             "rawSeatLayoutResponse": data,
         }
+
     err = Exception("Not enough matching seats for this candidate")
+    # attach server details for debugging like JS did
     err.details = data
     raise err
+
+
+def _reserve_one(tid, trip, token):
+    try:
+        rr = axios_req(ENDPOINTS["RESERVE"], {"ticket_id": tid, "route_id": trip.get("trip_route_id")}, token, "patch")
+        try:
+            rrdata = rr.json()
+        except Exception:
+            rrdata = {}
+        failed = rr.status_code >= 300 or (rrdata.get("data", {}).get("error") if isinstance(rrdata, dict) else False)
+        if failed:
+            return {"tid": tid, "ok": False, "reason": rrdata}
+        return {"tid": tid, "ok": True}
+    except Exception as e:
+        return {"tid": tid, "ok": False, "reason": str(e)}
+
+
+def _release_one(tid, trip, token):
+    try:
+        axios_req(ENDPOINTS["RELEASE_SEAT"], {"ticket_id": tid, "route_id": trip.get("trip_route_id")}, token, "patch")
+        return {"tid": tid, "ok": True}
+    except Exception as e:
+        return {"tid": tid, "ok": False, "reason": str(e)}
 
 
 def main():
     token = None
     trip = None
     successfully_reserved: List[Any] = []
-    rl_open = True
     otp_payload = None
 
     try:
@@ -266,28 +295,29 @@ def main():
         candidates = sorted_trains[:K]
 
         chosen = None
-        # probe candidates in parallel and pick first successful
         exceptions = []
+        # Probe top-K candidates in parallel, stop at first success (approx Promise.any)
         with ThreadPoolExecutor(max_workers=len(candidates) or 1) as ex:
-            futures = {ex.submit(probe_candidate, c, seat_class, token): c for c in candidates}
-            for fut in as_completed(futures):
-                try:
-                    res = fut.result()
-                    chosen = res
-                    break
-                except Exception as e:
-                    # collect errors
-                    exceptions.append(e)
-            # cancel other futures if possible
-            for fut in futures:
-                if not fut.done():
-                    fut.cancel()
+            future_to_train = {ex.submit(probe_candidate, c, seat_class, token): c for c in candidates}
+            try:
+                for fut in as_completed(future_to_train):
+                    try:
+                        res = fut.result()
+                        chosen = res
+                        # Once we have one, signal others and break
+                        found_candidate_event.set()
+                        break
+                    except Exception as e:
+                        # capture details if present
+                        exceptions.append(e)
+            finally:
+                # Not all in-flight requests can be forcefully cancelled, but we signal others to stop early.
+                pass
 
         if not chosen:
-            # try to extract details from one of the exceptions
             with_details = None
             for e in exceptions:
-                if hasattr(e, "details"):
+                if hasattr(e, "details") and getattr(e, "details"):
                     with_details = getattr(e, "details")
                     break
             err = Exception(f'No train found with at least {CONFIG["NEED_SEATS"]} available seats of class "{CONFIG["SEAT_CLASS"]}".')
@@ -313,14 +343,13 @@ def main():
         log("4) Reserving seats (in parallel)...")
         reserve_results = []
         with ThreadPoolExecutor(max_workers=len(ticketIdsToReserve) or 1) as ex:
-            futures = {ex.submit(lambda tid: _reserve_one(tid, trip, token), tid): tid for tid in ticketIdsToReserve}
+            futures = {ex.submit(_reserve_one, tid, trip, token): tid for tid in ticketIdsToReserve}
             for fut in as_completed(futures):
-                tid = futures[fut]
                 try:
                     res = fut.result()
                     reserve_results.append(res)
                 except Exception as e:
-                    reserve_results.append({"tid": tid, "ok": False, "reason": str(e)})
+                    reserve_results.append({"tid": futures.get(fut), "ok": False, "reason": str(e)})
 
         successes = [x for x in reserve_results if x.get("ok")]
         failures = [x for x in reserve_results if not x.get("ok")]
@@ -485,26 +514,20 @@ def main():
     except Exception as err:
         log("\nAn error occurred during the process:", str(err))
 
-        # Attempt to release reserved seats if any
+        # If we reserved seats, attempt parallel release (rollback) like JS Promise.all
         if successfully_reserved:
             log(f"Attempting to release {len(successfully_reserved)} reserved seat(s)...")
-            release_promises = []
-            for tid in successfully_reserved:
-                try:
-                    log(f"  - Releasing ticket ID: {tid}")
-                    if not ENDPOINTS.get("RELEASE_SEAT"):
-                        log("    - RELEASE_SEAT endpoint not configured; skipping release.")
-                        continue
-                    if not trip or not trip.get("trip_route_id"):
-                        log("    - trip or trip_route_id missing; cannot release ticket, skipping.")
-                        continue
+            with ThreadPoolExecutor(max_workers=len(successfully_reserved) or 1) as ex:
+                futures = [ex.submit(_release_one, tid, trip, token) for tid in successfully_reserved]
+                for fut in as_completed(futures):
                     try:
-                        axios_req(ENDPOINTS["RELEASE_SEAT"], {"ticket_id": tid, "route_id": trip.get("trip_route_id")}, token, "patch")
-                        log(f"    - Released {tid}")
+                        res = fut.result()
+                        if res.get("ok"):
+                            log(f"    - Released {res.get('tid')}")
+                        else:
+                            log(f"    - Failed to release {res.get('tid')}: {res.get('reason')}")
                     except Exception as release_err:
-                        log(f"    - Failed to release {tid}: {str(release_err)}")
-                except Exception as e:
-                    log("Failed during release attempt:", str(e))
+                        log(f"    - Failed to release: {str(release_err)}")
             log("Release attempts finished.")
 
         details = getattr(err, "details", None)
@@ -522,21 +545,6 @@ def main():
             fatal(short_msg, details)
         else:
             fatal(short_msg)
-
-
-def _reserve_one(tid, trip, token):
-    try:
-        rr = axios_req(ENDPOINTS["RESERVE"], {"ticket_id": tid, "route_id": trip.get("trip_route_id")}, token, "patch")
-        try:
-            rrdata = rr.json()
-        except Exception:
-            rrdata = {}
-        failed = rr.status_code >= 300 or rrdata.get("data", {}).get("error")
-        if failed:
-            return {"tid": tid, "ok": False, "reason": rrdata}
-        return {"tid": tid, "ok": True}
-    except Exception as e:
-        return {"tid": tid, "ok": False, "reason": str(e)}
 
 
 if __name__ == "__main__":
